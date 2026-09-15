@@ -6,22 +6,21 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use openharmony_ability::xcomponent::{Action, MouseButton as OhosMouseButton, TouchEvent};
-use openharmony_ability::{AxisEventData, InputSourceType, MouseAction, MouseEventData};
 use openharmony_ability::{
-  ime::KeyboardStatus, Event as MainEvent, ImeEvent, InputEvent, OpenHarmonyApp,
-  OpenHarmonyWaker,
+  ime::KeyboardStatus, Event as MainEvent, ImeEvent, InputEvent, OpenHarmonyApp, OpenHarmonyWaker,
 };
+use openharmony_ability::{AxisEventData, InputSourceType, MouseAction, MouseEventData};
 use openharmony_ability_plugin_app_control::{AppControlExt, ColorModeExt};
 
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::error;
 use crate::event::{self, ElementState, Force, StartCause};
 use crate::event_loop::{self, ControlFlow};
-use crate::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NativeKeyCode};
+use crate::keyboard::{Key, KeyCode, KeyLocation, ModifiersState};
 use crate::monitor;
 use crate::window::{self, Theme};
 
-use super::keycodes::{to_location, to_logical};
+use super::keycodes::{to_location, to_logical, to_physical};
 use super::monitor::MonitorHandle;
 use super::window::{WindowId, WINDOW_MIRRORS};
 
@@ -37,6 +36,47 @@ pub(crate) const THEME_OVERRIDE_LIGHT: u8 = 0;
 pub(crate) const THEME_OVERRIDE_DARK: u8 = 1;
 pub(crate) const THEME_OVERRIDE_FOLLOW: u8 = 2;
 pub(crate) static APP_THEME_OVERRIDE: AtomicU8 = AtomicU8::new(THEME_OVERRIDE_FOLLOW);
+
+/// Effective theme (override if set, else system color_mode) encoded for the
+/// ThemeChanged dispatch guard (issue Eulogizethesun/tauri#108). u8 pairs with
+/// the THEME_OVERRIDE_* constants' Light=0/Dark=1 encoding.
+const EFFECTIVE_THEME_LIGHT: u8 = 0;
+const EFFECTIVE_THEME_DARK: u8 = 1;
+const EFFECTIVE_THEME_UNSEEDED: u8 = 2;
+static LAST_EFFECTIVE_THEME: AtomicU8 = AtomicU8::new(EFFECTIVE_THEME_UNSEEDED);
+
+/// Last dispatched outer rect per OHOS window id (left, top, width, height),
+/// used to split windowRectChange events into Moved/Resized (issue
+/// Eulogizethesun/tauri#107). Mutex (not thread_local) because lifecycle
+/// callbacks and the run_loop may dispatch from different threads.
+static LAST_DISPATCHED_RECTS: std::sync::LazyLock<
+  std::sync::Mutex<std::collections::HashMap<i64, (i32, i32, i32, i32)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Currently active keyboard modifiers, tracked from modifier key Down/Up
+/// events (the NDK KeyEventData carries no modifier state; issue
+/// Eulogizethesun/tauri#109). Read by the mouse/wheel handlers to populate the
+/// deprecated `modifiers` field, and diffed on every key event to dispatch
+/// `WindowEvent::ModifiersChanged`. Mutex: XComponent input callbacks and the
+/// run_loop focus handlers run on different threads.
+static KEYBOARD_MODIFIERS: std::sync::Mutex<ModifiersState> =
+  std::sync::Mutex::new(ModifiersState::empty());
+
+/// Effective theme for the whole app: the explicit override when set, else the
+/// system color_mode (Light for NoSet — matches `Window::theme`'s fallback).
+/// Shared by `Window::theme()` and the ConfigChanged ThemeChanged dispatch.
+pub(crate) fn effective_theme(app: &OpenHarmonyApp) -> Theme {
+  use openharmony_ability::ColorMode;
+  match APP_THEME_OVERRIDE.load(Ordering::Relaxed) {
+    THEME_OVERRIDE_DARK => Theme::Dark,
+    THEME_OVERRIDE_LIGHT => Theme::Light,
+    _ => match app.config().color_mode {
+      ColorMode::Dark => Theme::Dark,
+      // Light or NoSet (no ConfigChanged received before startup) → Light.
+      _ => Theme::Light,
+    },
+  }
+}
 
 /// Last known cursor position lives in the process-level cursor statics inside
 /// openharmony-ability (vp, MainPage-relative), fed by the ArkTS
@@ -59,35 +99,35 @@ pub(crate) static APP_THEME_OVERRIDE: AtomicU8 = AtomicU8::new(THEME_OVERRIDE_FO
 /// safely cloneable and can be stored in both `EventLoop` and `Window`.
 #[derive(Clone)]
 pub(crate) struct BridgeExecutor {
-    handle: tokio::runtime::Handle,
+  handle: tokio::runtime::Handle,
 }
 
 impl BridgeExecutor {
-    fn new() -> Self {
-        // Panics here are acceptable: this runs exactly once during EventLoop
-        // construction, before the app is functional or any recovery path
-        // exists. A failure to build the tokio runtime or spawn its driver
-        // thread leaves the bridge (and thus all async window operations)
-        // unusable, so aborting is the only sane option.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create OHOS bridge runtime");
-        let handle = runtime.handle().clone();
-        std::thread::Builder::new()
-            .name("ohos-bridge-rt".into())
-            .spawn(move || runtime.block_on(std::future::pending::<()>()))
-            .expect("Failed to spawn bridge runtime thread");
-        Self { handle }
-    }
+  fn new() -> Self {
+    // Panics here are acceptable: this runs exactly once during EventLoop
+    // construction, before the app is functional or any recovery path
+    // exists. A failure to build the tokio runtime or spawn its driver
+    // thread leaves the bridge (and thus all async window operations)
+    // unusable, so aborting is the only sane option.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("Failed to create OHOS bridge runtime");
+    let handle = runtime.handle().clone();
+    std::thread::Builder::new()
+      .name("ohos-bridge-rt".into())
+      .spawn(move || runtime.block_on(std::future::pending::<()>()))
+      .expect("Failed to spawn bridge runtime thread");
+    Self { handle }
+  }
 
-    /// Spawn a fire-and-forget bridge call. The result is ignored.
-    pub(crate) fn spawn<F>(&self, future: F)
-    where
-        F: std::future::Future<Output = ()> + Send + 'static,
-    {
-        self.handle.spawn(future);
-    }
+  /// Spawn a fire-and-forget bridge call. The result is ignored.
+  pub(crate) fn spawn<F>(&self, future: F)
+  where
+    F: std::future::Future<Output = ()> + Send + 'static,
+  {
+    self.handle.spawn(future);
+  }
 }
 
 // Tracks currently pressed keys for repeat detection.
@@ -98,6 +138,35 @@ thread_local! {
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct KeyEventExtra {}
+
+/// Map an OHOS modifier keycode to its tao modifier bit (issue
+/// Eulogizethesun/tauri#109). `None` for non-modifier keys. Both left/right
+/// variants map to the same bit; `KeyLocation` still disambiguates them in
+/// the key event itself.
+fn keycode_as_modifier(
+  keycode: openharmony_ability::xcomponent::KeyCode,
+) -> Option<ModifiersState> {
+  use openharmony_ability::xcomponent::KeyCode::*;
+
+  let bit = match keycode {
+    ShiftLeft | ShiftRight => ModifiersState::SHIFT,
+    CtrlLeft | CtrlRight => ModifiersState::CONTROL,
+    AltLeft | AltRight => ModifiersState::ALT,
+    MetaLeft | MetaRight => ModifiersState::SUPER,
+    _ => return None,
+  };
+  Some(bit)
+}
+
+/// Snapshot of the tracked keyboard modifiers (empty when the lock is
+/// poisoned), used to populate the deprecated `modifiers` field on mouse and
+/// wheel events (issue Eulogizethesun/tauri#109).
+fn current_modifiers() -> ModifiersState {
+  KEYBOARD_MODIFIERS
+    .lock()
+    .map(|modifiers| *modifiers)
+    .unwrap_or_else(|poisoned| *poisoned.into_inner())
+}
 
 /// Map an OHOS NDK MouseButton to tao's MouseButton.
 ///
@@ -211,18 +280,17 @@ pub(crate) fn set_app_theme(app: &OpenHarmonyApp, theme: Option<Theme>) {
   }
 }
 
-/// Shared monitor_from_point: OHOS is single-display, so return the (only)
-/// monitor when the point is within the default display bounds (DisplayManager
-/// physical pixels). See ohos-monitor-real-values. Used by both
+/// Shared monitor_from_point: hit-test the point against every display's
+/// bounds in the global coordinate space (positions from ArkTS Display.x/y,
+/// issue Eulogizethesun/tauri#106 — previously only the default display's
+/// bounds at (0,0) were tested). Used by both
 /// `EventLoopWindowTarget::monitor_from_point` and `Window::monitor_from_point`.
-pub(crate) fn monitor_from_point_for_app(app: &OpenHarmonyApp, x: f64, y: f64) -> Option<MonitorHandle> {
-  let w = app.display_width() as f64;
-  let h = app.display_height() as f64;
-  if w > 0.0 && h > 0.0 && x >= 0.0 && y >= 0.0 && x < w && y < h {
-    Some(MonitorHandle::new(app.clone()))
-  } else {
-    None
-  }
+pub(crate) fn monitor_from_point_for_app(
+  app: &OpenHarmonyApp,
+  x: f64,
+  y: f64,
+) -> Option<MonitorHandle> {
+  MonitorHandle::from_point(app, x, y)
 }
 
 pub struct EventLoop<T: 'static> {
@@ -283,7 +351,10 @@ impl<T: 'static> EventLoop<T> {
   // not own an XComponent / render surface). All input dispatch therefore uses
   // window_id = 0 (main window). Phase 3 (design.md D6) only routes per-window for
   // WindowResize / ContentRectChange; input remains main-window-scoped.
-  fn handle_input_event(event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>, event: &InputEvent) {
+  fn handle_input_event(
+    event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>,
+    event: &InputEvent,
+  ) {
     #[allow(unreachable_patterns)]
     match event {
       InputEvent::TouchEvent(motion_event) => {
@@ -348,13 +419,50 @@ impl<T: 'static> EventLoop<T> {
             let mut keys = keys.borrow_mut();
             match key.action {
               Action::Down => !keys.insert(key_raw), // false if already present → repeat
-              Action::Up => { keys.remove(&key_raw); false }
+              Action::Up => {
+                keys.remove(&key_raw);
+                false
+              }
               _ => false,
             }
           });
 
-          let native = NativeKeyCode::Ohos(keycode.into());
-          let physical_key = KeyCode::Unidentified(native);
+          // Modifier tracking (issue Eulogizethesun/tauri#109): the NDK
+          // KeyEventData carries no modifier state, so derive it from the
+          // modifier keycodes themselves and dispatch ModifiersChanged on
+          // transitions (before the key event, matching other backends).
+          // Transition-gated: pressing the pair's other side (ShiftLeft then
+          // ShiftRight) does not change the modifier set — no redundant
+          // ModifiersChanged is dispatched, only the key event.
+          if let Some(modifier) = keycode_as_modifier(keycode) {
+            if let Ok(mut modifiers) = KEYBOARD_MODIFIERS.lock() {
+              // ModifiersState is bitflags: insert/remove return (), so probe
+              // membership first to detect an actual state transition.
+              let changed = match state {
+                event::ElementState::Pressed => {
+                  let newly_held = !modifiers.contains(modifier);
+                  modifiers.insert(modifier);
+                  newly_held
+                }
+                event::ElementState::Released => {
+                  let was_held = modifiers.contains(modifier);
+                  modifiers.remove(modifier);
+                  was_held
+                }
+              };
+              if changed {
+                call_event_handler!(
+                  event_loop_cell,
+                  event::Event::WindowEvent {
+                    window_id: window::WindowId(WindowId(0)),
+                    event: event::WindowEvent::ModifiersChanged(*modifiers),
+                  }
+                );
+              }
+            }
+          }
+
+          let physical_key = to_physical(keycode);
           let logical_key = to_logical(keycode);
 
           call_event_handler!(
@@ -415,7 +523,10 @@ impl<T: 'static> EventLoop<T> {
   }
 
   /// Handle mouse events from the OHOS NDK, converting them to tao WindowEvents.
-  fn handle_mouse_event(event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>, mouse_event: &MouseEventData) {
+  fn handle_mouse_event(
+    event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>,
+    mouse_event: &MouseEventData,
+  ) {
     let window_id = window::WindowId(WindowId(0));
     // Use device_id 0 for mouse, consistent across events.
     let device_id = event::DeviceId(DeviceId(0));
@@ -436,7 +547,7 @@ impl<T: 'static> EventLoop<T> {
             event: event::WindowEvent::CursorMoved {
               device_id,
               position,
-              modifiers: ModifiersState::empty(),
+              modifiers: current_modifiers(),
             },
           }
         );
@@ -451,7 +562,7 @@ impl<T: 'static> EventLoop<T> {
                 device_id,
                 state: ElementState::Pressed,
                 button,
-                modifiers: ModifiersState::empty(),
+                modifiers: current_modifiers(),
               },
             }
           );
@@ -467,7 +578,7 @@ impl<T: 'static> EventLoop<T> {
                 device_id,
                 state: ElementState::Released,
                 button,
-                modifiers: ModifiersState::empty(),
+                modifiers: current_modifiers(),
               },
             }
           );
@@ -498,7 +609,10 @@ impl<T: 'static> EventLoop<T> {
   }
 
   /// Handle axis (scroll wheel) events from the OHOS ArkUI runtime.
-  fn handle_axis_event(event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>, axis_event: &AxisEventData) {
+  fn handle_axis_event(
+    event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>,
+    axis_event: &AxisEventData,
+  ) {
     let window_id = window::WindowId(WindowId(0));
     let device_id = event::DeviceId(DeviceId(0));
     let is_touchpad = axis_event.source_type == InputSourceType::Touchpad;
@@ -523,7 +637,7 @@ impl<T: 'static> EventLoop<T> {
             device_id,
             delta,
             phase: event::TouchPhase::Moved,
-            modifiers: ModifiersState::empty(),
+            modifiers: current_modifiers(),
           },
         }
       );
@@ -548,7 +662,9 @@ impl<T: 'static> EventLoop<T> {
             device_id,
             delta: event::MouseScrollDelta::LineDelta(0.0, zoom_delta),
             phase: event::TouchPhase::Moved,
-            modifiers: ModifiersState::CONTROL,
+            // Synthesized zoom gesture: Ctrl on top of the tracked modifiers
+            // (issue #109 — was hardcoded CONTROL, discarding real state).
+            modifiers: current_modifiers() | ModifiersState::CONTROL,
           },
         }
       );
@@ -659,7 +775,8 @@ impl<T: 'static> EventLoop<T> {
               log::warn!(
                 "[tao-ohos] pending window status for id {} (status={}) matched no live window \
                  (stale id: window destroyed between enqueue and drain)",
-                ohos_win_id, status
+                ohos_win_id,
+                status
               );
             } else {
               log::debug!(
@@ -706,19 +823,80 @@ impl<T: 'static> EventLoop<T> {
           // webview.set_bounds() with the new window dimensions.
           // Phase 3 (design.md D6): route by content_rect.window_id (populated by the
           // window_rect_change lifecycle closure from the ArkTS-wrapped windowId).
-          let size = PhysicalSize::new(content_rect.rect.width as _, content_rect.rect.height as _);
-          call_event_handler!(
-            event_loop_cell,
-            event::Event::WindowEvent {
-              window_id: window::WindowId(WindowId(content_rect.window_id)),
-              event: event::WindowEvent::Resized(size),
-            }
+          // KNOWN口径 GAP (issue #97 review, pre-existing): this carries the OUTER
+          // windowRect, while tao's Resized semantically carries the INNER size on
+          // other platforms — the app-facing path is corrected downstream
+          // (tauri-runtime-wry re-reads inner_size), but raw-event consumers see
+          // the outer size. Follow-up: prefer the same event's drawableRect.
+          //
+          // Issue Eulogizethesun/tauri#107: windowRectChange covers position AND
+          // size, but this arm only ever dispatched Resized, so WindowEvent::Moved
+          // never fired. Diff against the last dispatched rect per window:
+          // - position change → Moved, size change → Resized (both when both);
+          // - first rect for a window seeds the cache and still dispatches the
+          //   legacy Resized (Float sub-windows have no XComponent surface, so
+          //   this event is their only initial-size signal);
+          // - degenerate rects (minimize/hide collapse to 0×0) only update the
+          //   cache — dispatching Resized(0,0) would corrupt downstream bounds.
+          let window_id = content_rect.window_id;
+          let (left, top, width, height) = (
+            content_rect.rect.left,
+            content_rect.rect.top,
+            content_rect.rect.width,
+            content_rect.rect.height,
           );
+          let degenerate = width <= 0 || height <= 0;
+          let prev = LAST_DISPATCHED_RECTS
+            .lock()
+            .ok()
+            .and_then(|mut rects| rects.insert(window_id, (left, top, width, height)));
+          match prev {
+            None => {
+              if !degenerate {
+                let size = PhysicalSize::new(width as _, height as _);
+                call_event_handler!(
+                  event_loop_cell,
+                  event::Event::WindowEvent {
+                    window_id: window::WindowId(WindowId(window_id)),
+                    event: event::WindowEvent::Resized(size),
+                  }
+                );
+              }
+            }
+            Some((prev_left, prev_top, prev_width, prev_height)) if !degenerate => {
+              if (prev_left, prev_top) != (left, top) {
+                call_event_handler!(
+                  event_loop_cell,
+                  event::Event::WindowEvent {
+                    window_id: window::WindowId(WindowId(window_id)),
+                    event: event::WindowEvent::Moved(PhysicalPosition::new(left, top)),
+                  }
+                );
+              }
+              if (prev_width, prev_height) != (width, height) {
+                let size = PhysicalSize::new(width as _, height as _);
+                call_event_handler!(
+                  event_loop_cell,
+                  event::Event::WindowEvent {
+                    window_id: window::WindowId(WindowId(window_id)),
+                    event: event::WindowEvent::Resized(size),
+                  }
+                );
+              }
+            }
+            _ => {}
+          }
         }
         MainEvent::GainedFocus => {
           // Focus is an app-level UIAbility stage event (StageEventType::ACTIVE),
           // not per-Float-sub-window. Keep window_id = 0 (main window).
           HAS_FOCUS.store(true, Ordering::Relaxed);
+          // Modifier state is tracked from key events (issue #109); a window
+          // that regained focus may have missed modifier releases while
+          // unfocused — start clean rather than trust a stale set.
+          if let Ok(mut modifiers) = KEYBOARD_MODIFIERS.lock() {
+            *modifiers = ModifiersState::empty();
+          }
           call_event_handler!(
             event_loop_cell,
             event::Event::WindowEvent {
@@ -755,6 +933,42 @@ impl<T: 'static> EventLoop<T> {
               },
             }
           );
+          // Issue Eulogizethesun/tauri#108: onConfigurationUpdate → ConfigChanged
+          // carries the new colorMode (app.config() is already updated by the
+          // lifecycle closure before dispatch), but ThemeChanged was never
+          // dispatched — apps had to poll theme(). Emit ThemeChanged when the
+          // EFFECTIVE theme (override-aware, same source as `Window::theme`)
+          // changed. First event seeds the baseline (theme is unknowable before
+          // any ConfigChanged — initial color_mode is NoSet), so it also emits;
+          // apps re-applying the current theme on that first event is harmless.
+          // Dispatched to every live window (theme is app-global on OHOS; the
+          // registry covers main + Float sub-windows).
+          let theme = effective_theme(&app);
+          let theme_bits = match theme {
+            Theme::Dark => EFFECTIVE_THEME_DARK,
+            Theme::Light => EFFECTIVE_THEME_LIGHT,
+          };
+          let prev_bits = LAST_EFFECTIVE_THEME.swap(theme_bits, Ordering::Relaxed);
+          if prev_bits != theme_bits {
+            let window_ids: Vec<i64> = WINDOW_MIRRORS
+              .lock()
+              .map(|mirrors| mirrors.keys().copied().collect())
+              .unwrap_or_default();
+            let window_ids = if window_ids.is_empty() {
+              vec![0]
+            } else {
+              window_ids
+            };
+            for wid in window_ids {
+              call_event_handler!(
+                event_loop_cell,
+                event::Event::WindowEvent {
+                  window_id: window::WindowId(WindowId(wid)),
+                  event: event::WindowEvent::ThemeChanged(theme),
+                }
+              );
+            }
+          }
         }
         MainEvent::Start => {
           // WindowStageEventType::SHOWN (window visible to user). Forwarded as
@@ -772,7 +986,9 @@ impl<T: 'static> EventLoop<T> {
           // variant). Degraded: dropped with debug log. Apps must persist state via
           // tauri RunEvent::Exit/ExitRequested or custom logic.
           // See openspec ohos-event-lifecycle-forward.
-          debug!("SaveState has no tao Event equivalent; dropped (see ohos-event-lifecycle-forward)");
+          debug!(
+            "SaveState has no tao Event equivalent; dropped (see ohos-event-lifecycle-forward)"
+          );
         }
         MainEvent::Pause => {
           debug!("App Paused - stopped running");
@@ -806,6 +1022,18 @@ impl<T: 'static> EventLoop<T> {
         }
         MainEvent::Destroy => {
           call_event_handler!(event_loop_cell, event::Event::LoopDestroyed);
+        }
+        MainEvent::PrepareToTerminate { answer } => {
+          // PC/2in1 pre-close probe (UIAbility.onPrepareToTerminateAsync, issue
+          // Eulogizethesun/tauri#103): the cancellable counterpart of the
+          // MainEvent::Destroy → LoopDestroyed path above. Forwarded as a
+          // dedicated Event so tauri-runtime-wry runs its ExitRequested
+          // dispatch BEFORE any teardown and records the decision on `answer`
+          // — prevent_exit() here genuinely keeps the app alive (ArkTS cancels
+          // the termination) instead of firing into an unstoppable destroy.
+          // The reference lives on the ability-side NAPI closure's stack for
+          // the duration of this synchronous dispatch.
+          call_event_handler!(event_loop_cell, event::Event::PrepareToTerminate { answer });
         }
         MainEvent::Input(input_event) => {
           Self::handle_input_event(&event_loop_cell, &input_event);
@@ -924,14 +1152,13 @@ pub struct EventLoopWindowTarget<T: 'static> {
 
 impl<T: 'static> EventLoopWindowTarget<T> {
   pub fn available_monitors(&self) -> VecDeque<MonitorHandle> {
-    let mut v = VecDeque::with_capacity(1);
-    v.push_back(MonitorHandle::new(self.app.clone()));
-    v
+    // One handle per connected display (issue Eulogizethesun/tauri#106).
+    MonitorHandle::all_for_app(&self.app).into_iter().collect()
   }
 
   pub fn primary_monitor(&self) -> Option<monitor::MonitorHandle> {
     Some(monitor::MonitorHandle {
-      inner: MonitorHandle::new(self.app.clone()),
+      inner: MonitorHandle::primary_for_app(&self.app),
     })
   }
 
@@ -979,10 +1206,10 @@ impl DeviceId {
 #[cfg(test)]
 mod input_tests {
   use super::*;
-  use openharmony_ability::TextInputEventData;
   use openharmony_ability::xcomponent::{
     EventSource, KeyCode as OhosKeyCode, KeyEventData, TouchEventData, TouchPointData,
   };
+  use openharmony_ability::TextInputEventData;
   use std::sync::Mutex;
 
   type LoopCell<T> = Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>;
@@ -1006,7 +1233,9 @@ mod input_tests {
           // `modifiers` is deprecated in favor of ModifiersChanged, but the
           // synthetic wheel events still carry it — fine for a test matcher.
           #[allow(deprecated)]
-          event::WindowEvent::MouseWheel { delta, modifiers, .. } => format!(
+          event::WindowEvent::MouseWheel {
+            delta, modifiers, ..
+          } => format!(
             "MouseWheel({:?},ctrl={})",
             delta,
             modifiers.contains(ModifiersState::CONTROL)
@@ -1018,6 +1247,13 @@ mod input_tests {
           event::WindowEvent::KeyboardInput { event: ke, .. } => format!(
             "Key({:?},{:?},loc={:?},repeat={})",
             ke.state, ke.logical_key, ke.location, ke.repeat
+          ),
+          event::WindowEvent::ModifiersChanged(m) => format!(
+            "ModifiersChanged(ctrl={},shift={},alt={},logo={})",
+            m.contains(ModifiersState::CONTROL),
+            m.contains(ModifiersState::SHIFT),
+            m.contains(ModifiersState::ALT),
+            m.contains(ModifiersState::SUPER)
           ),
           event::WindowEvent::ReceivedImeText(s) => format!("ImeText({s})"),
           _ => "Other".to_string(),
@@ -1032,7 +1268,13 @@ mod input_tests {
   }
 
   fn mouse(action: MouseAction, button: OhosMouseButton) -> MouseEventData {
-    MouseEventData { x: 10.5, y: 20.25, action, button, ..Default::default() }
+    MouseEventData {
+      x: 10.5,
+      y: 20.25,
+      action,
+      button,
+      ..Default::default()
+    }
   }
 
   // ─── handle_mouse_event ──────────────────────────────────────────────
@@ -1171,8 +1413,14 @@ mod input_tests {
   #[test]
   fn axis_pinch_zoom_in_and_out_emit_ctrl_wheel() {
     let evs = run_collected(|cell| {
-      let in_ = AxisEventData { pinch_scale: 1.5, ..Default::default() };
-      let out_ = AxisEventData { pinch_scale: 0.5, ..Default::default() };
+      let in_ = AxisEventData {
+        pinch_scale: 1.5,
+        ..Default::default()
+      };
+      let out_ = AxisEventData {
+        pinch_scale: 0.5,
+        ..Default::default()
+      };
       EventLoop::<()>::handle_axis_event(cell, &in_);
       EventLoop::<()>::handle_axis_event(cell, &out_);
     });
@@ -1224,7 +1472,10 @@ mod input_tests {
 
   #[test]
   fn touch_down_emits_started_per_pointer() {
-    let mut touch = TouchEventData { event_type: TouchEvent::Down, ..Default::default() };
+    let mut touch = TouchEventData {
+      event_type: TouchEvent::Down,
+      ..Default::default()
+    };
     touch.touch_points = vec![
       TouchPointData {
         id: 7,
@@ -1262,23 +1513,37 @@ mod input_tests {
       (TouchEvent::Up, "Ended"),
       (TouchEvent::Cancel, "Cancelled"),
     ] {
-      let mut touch = TouchEventData { event_type: ty, ..Default::default() };
-      touch.touch_points = vec![
-        TouchPointData { id: 1, event_type: ty, ..Default::default() },
-      ];
+      let mut touch = TouchEventData {
+        event_type: ty,
+        ..Default::default()
+      };
+      touch.touch_points = vec![TouchPointData {
+        id: 1,
+        event_type: ty,
+        ..Default::default()
+      }];
       let evs = run_collected(|cell| {
         EventLoop::<()>::handle_input_event(cell, &InputEvent::TouchEvent(touch.clone()));
       });
-      assert_eq!(evs, vec![format!("Touch({phase},0,0,id=1)")], "phase {phase}");
+      assert_eq!(
+        evs,
+        vec![format!("Touch({phase},0,0,id=1)")],
+        "phase {phase}"
+      );
     }
   }
 
   #[test]
   fn touch_unknown_event_type_emits_nothing() {
-    let mut touch = TouchEventData { event_type: TouchEvent::Unknown, ..Default::default() };
-    touch.touch_points = vec![
-      TouchPointData { id: 1, event_type: TouchEvent::Unknown, ..Default::default() },
-    ];
+    let mut touch = TouchEventData {
+      event_type: TouchEvent::Unknown,
+      ..Default::default()
+    };
+    touch.touch_points = vec![TouchPointData {
+      id: 1,
+      event_type: TouchEvent::Unknown,
+      ..Default::default()
+    }];
     let evs = run_collected(|cell| {
       EventLoop::<()>::handle_input_event(cell, &InputEvent::TouchEvent(touch));
     });
@@ -1322,10 +1587,16 @@ mod input_tests {
       EventLoop::<()>::handle_input_event(cell, &key(OhosKeyCode::ShiftRight, Action::Down));
       EventLoop::<()>::handle_input_event(cell, &key(OhosKeyCode::Numpad5, Action::Down));
     });
-    assert_eq!(evs.len(), 3);
-    assert!(evs[0].contains("loc=Left"), "{}", evs[0]);
-    assert!(evs[1].contains("loc=Right"), "{}", evs[1]);
-    assert!(evs[2].contains("loc=Numpad"), "{}", evs[2]);
+    // #109 modifier tracking: the first Shift Down transitions the modifier
+    // set (none → SHIFT) and dispatches ModifiersChanged BEFORE the key
+    // event; ShiftRight adds no new modifier (SHIFT already held), so no
+    // redundant ModifiersChanged — just its key event; Numpad5 is not a
+    // modifier. 4 events total.
+    assert_eq!(evs.len(), 4, "{:?}", evs);
+    assert!(evs[0].contains("ModifiersChanged"), "{}", evs[0]);
+    assert!(evs[1].contains("loc=Left"), "{}", evs[1]);
+    assert!(evs[2].contains("loc=Right"), "{}", evs[2]);
+    assert!(evs[3].contains("loc=Numpad"), "{}", evs[3]);
     PRESSED_KEYS.with(|k| k.borrow_mut().clear());
   }
 
@@ -1347,14 +1618,8 @@ mod input_tests {
   #[test]
   fn ime_backspace_and_enter_mock_press_release_pairs() {
     let evs = run_collected(|cell| {
-      EventLoop::<()>::handle_input_event(
-        cell,
-        &InputEvent::ImeEvent(ImeEvent::BackspaceEvent(1)),
-      );
-      EventLoop::<()>::handle_input_event(
-        cell,
-        &InputEvent::ImeEvent(ImeEvent::EnterEvent(1)),
-      );
+      EventLoop::<()>::handle_input_event(cell, &InputEvent::ImeEvent(ImeEvent::BackspaceEvent(1)));
+      EventLoop::<()>::handle_input_event(cell, &InputEvent::ImeEvent(ImeEvent::EnterEvent(1)));
     });
     assert_eq!(evs.len(), 4);
     assert!(evs[0].starts_with("Key(Pressed,Backspace"), "{}", evs[0]);
@@ -1377,7 +1642,9 @@ mod input_tests {
     });
     assert_eq!(evs.len(), 2);
     assert!(
-      evs.iter().all(|e| e.starts_with("Key(") && e.contains("Enter")),
+      evs
+        .iter()
+        .all(|e| e.starts_with("Key(") && e.contains("Enter")),
       "{evs:?}"
     );
   }

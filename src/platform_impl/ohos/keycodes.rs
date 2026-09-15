@@ -1,7 +1,17 @@
 use openharmony_ability::xcomponent::KeyCode as Keycode;
 
-use crate::keyboard::{Key, KeyLocation, NativeKeyCode};
+use crate::keyboard::{Key, KeyCode, KeyLocation, NativeKeyCode};
 
+/// Map an OHOS keycode to tao's logical `Key`.
+///
+/// Issue Eulogizethesun/tauri#109: letters, digits and punctuation used to
+/// fall through to `Unidentified` on the assumption that a "Unicode character"
+/// path (Android's `getUnicodeChar`) would resolve them first — but the NDK
+/// XComponent key event carries no produced character on OHOS, so that path
+/// never existed here and the fallback was the only path. The keycodes
+/// themselves are unambiguous, so map them to base characters directly. This
+/// is the unshifted character (no layout/caps awareness); consumers needing
+/// the produced text use the IME events.
 pub fn to_logical(keycode: Keycode) -> Key<'static> {
   use openharmony_ability::xcomponent::KeyCode::*;
 
@@ -14,59 +24,60 @@ pub fn to_logical(keycode: Keycode) -> Key<'static> {
     Back => Key::BrowserBack,
 
     //-------------------------------------------------------------------------------
-    // These should be redundant because they should have already been matched
-    // as `KeyMapChar::Unicode`, but also matched here as a fallback
-    Key0 => Key::Unidentified(native),
-    Key1 => Key::Unidentified(native),
-    Key2 => Key::Unidentified(native),
-    Key3 => Key::Unidentified(native),
-    Key4 => Key::Unidentified(native),
-    Key5 => Key::Unidentified(native),
-    Key6 => Key::Unidentified(native),
-    Key7 => Key::Unidentified(native),
-    Key8 => Key::Unidentified(native),
-    Key9 => Key::Unidentified(native),
-    Star => Key::Unidentified(native),
-    Pound => Key::Unidentified(native),
-    A => Key::Unidentified(native),
-    B => Key::Unidentified(native),
-    C => Key::Unidentified(native),
-    D => Key::Unidentified(native),
-    E => Key::Unidentified(native),
-    F => Key::Unidentified(native),
-    G => Key::Unidentified(native),
-    H => Key::Unidentified(native),
-    I => Key::Unidentified(native),
-    J => Key::Unidentified(native),
-    K => Key::Unidentified(native),
-    L => Key::Unidentified(native),
-    M => Key::Unidentified(native),
-    N => Key::Unidentified(native),
-    O => Key::Unidentified(native),
-    P => Key::Unidentified(native),
-    Q => Key::Unidentified(native),
-    R => Key::Unidentified(native),
-    S => Key::Unidentified(native),
-    T => Key::Unidentified(native),
-    U => Key::Unidentified(native),
-    V => Key::Unidentified(native),
-    W => Key::Unidentified(native),
-    X => Key::Unidentified(native),
-    Y => Key::Unidentified(native),
-    Z => Key::Unidentified(native),
-    Comma => Key::Unidentified(native),
-    Period => Key::Unidentified(native),
-    Grave => Key::Unidentified(native),
-    Minus => Key::Unidentified(native),
-    Equals => Key::Unidentified(native),
-    LeftBracket => Key::Unidentified(native),
-    RightBracket => Key::Unidentified(native),
-    Backslash => Key::Unidentified(native),
-    Semicolon => Key::Unidentified(native),
-    Apostrophe => Key::Unidentified(native),
-    Slash => Key::Unidentified(native),
-    At => Key::Unidentified(native),
-    Plus => Key::Unidentified(native),
+    // Letters, digits and punctuation: OHOS keycodes are layout-independent and
+    // unambiguous, so map them to their base `Character` (issue #109 — was
+    // Unidentified because the Android-style Unicode path doesn't exist here).
+    Key0 => Key::Character("0".into()),
+    Key1 => Key::Character("1".into()),
+    Key2 => Key::Character("2".into()),
+    Key3 => Key::Character("3".into()),
+    Key4 => Key::Character("4".into()),
+    Key5 => Key::Character("5".into()),
+    Key6 => Key::Character("6".into()),
+    Key7 => Key::Character("7".into()),
+    Key8 => Key::Character("8".into()),
+    Key9 => Key::Character("9".into()),
+    Star => Key::Character("*".into()),
+    Pound => Key::Character("#".into()),
+    A => Key::Character("a".into()),
+    B => Key::Character("b".into()),
+    C => Key::Character("c".into()),
+    D => Key::Character("d".into()),
+    E => Key::Character("e".into()),
+    F => Key::Character("f".into()),
+    G => Key::Character("g".into()),
+    H => Key::Character("h".into()),
+    I => Key::Character("i".into()),
+    J => Key::Character("j".into()),
+    K => Key::Character("k".into()),
+    L => Key::Character("l".into()),
+    M => Key::Character("m".into()),
+    N => Key::Character("n".into()),
+    O => Key::Character("o".into()),
+    P => Key::Character("p".into()),
+    Q => Key::Character("q".into()),
+    R => Key::Character("r".into()),
+    S => Key::Character("s".into()),
+    T => Key::Character("t".into()),
+    U => Key::Character("u".into()),
+    V => Key::Character("v".into()),
+    W => Key::Character("w".into()),
+    X => Key::Character("x".into()),
+    Y => Key::Character("y".into()),
+    Z => Key::Character("z".into()),
+    Comma => Key::Character(",".into()),
+    Period => Key::Character(".".into()),
+    Grave => Key::Character("`".into()),
+    Minus => Key::Character("-".into()),
+    Equals => Key::Character("=".into()),
+    LeftBracket => Key::Character("[".into()),
+    RightBracket => Key::Character("]".into()),
+    Backslash => Key::Character("\\".into()),
+    Semicolon => Key::Character(";".into()),
+    Apostrophe => Key::Character("'".into()),
+    Slash => Key::Character("/".into()),
+    At => Key::Character("@".into()),
+    Plus => Key::Character("+".into()),
     //-------------------------------------------------------------------------------
     DpadUp => Key::ArrowUp,
     DpadDown => Key::ArrowDown,
@@ -142,26 +153,28 @@ pub fn to_logical(keycode: Keycode) -> Key<'static> {
     F11 => Key::F11,
     F12 => Key::F12,
     NumLock => Key::NumLock,
-    Numpad0 => Key::Unidentified(native),
-    Numpad1 => Key::Unidentified(native),
-    Numpad2 => Key::Unidentified(native),
-    Numpad3 => Key::Unidentified(native),
-    Numpad4 => Key::Unidentified(native),
-    Numpad5 => Key::Unidentified(native),
-    Numpad6 => Key::Unidentified(native),
-    Numpad7 => Key::Unidentified(native),
-    Numpad8 => Key::Unidentified(native),
-    Numpad9 => Key::Unidentified(native),
-    NumpadDivide => Key::Unidentified(native),
-    NumpadMultiply => Key::Unidentified(native),
-    NumpadSubtract => Key::Unidentified(native),
-    NumpadAdd => Key::Unidentified(native),
-    NumpadDot => Key::Unidentified(native),
-    NumpadComma => Key::Unidentified(native),
-    NumpadEnter => Key::Unidentified(native),
-    NumpadEquals => Key::Unidentified(native),
-    NumpadLeftParen => Key::Unidentified(native),
-    NumpadRightParen => Key::Unidentified(native),
+    // Numpad keys: logical = the character the key produces (NumLock on).
+    // `to_location` still reports `KeyLocation::Numpad` for disambiguation.
+    Numpad0 => Key::Character("0".into()),
+    Numpad1 => Key::Character("1".into()),
+    Numpad2 => Key::Character("2".into()),
+    Numpad3 => Key::Character("3".into()),
+    Numpad4 => Key::Character("4".into()),
+    Numpad5 => Key::Character("5".into()),
+    Numpad6 => Key::Character("6".into()),
+    Numpad7 => Key::Character("7".into()),
+    Numpad8 => Key::Character("8".into()),
+    Numpad9 => Key::Character("9".into()),
+    NumpadDivide => Key::Character("/".into()),
+    NumpadMultiply => Key::Character("*".into()),
+    NumpadSubtract => Key::Character("-".into()),
+    NumpadAdd => Key::Character("+".into()),
+    NumpadDot => Key::Character(".".into()),
+    NumpadComma => Key::Character(",".into()),
+    NumpadEnter => Key::Enter,
+    NumpadEquals => Key::Character("=".into()),
+    NumpadLeftParen => Key::Character("(".into()),
+    NumpadRightParen => Key::Character(")".into()),
 
     VolumeMute => Key::AudioVolumeMute,
     Info => Key::Info,
@@ -336,6 +349,186 @@ pub fn to_logical(keycode: Keycode) -> Key<'static> {
   }
 }
 
+/// Map an OHOS keycode to tao's physical `KeyCode` (issue
+/// Eulogizethesun/tauri#109). OHOS keycodes are layout-independent scan
+/// positions — exactly what `physical_key` means — so the mapping is direct.
+/// Unmapped keys fall back to `Unidentified(NativeKeyCode::Ohos(..))`, which
+/// still carries the raw OHOS code for downstream consumers.
+pub fn to_physical(keycode: Keycode) -> KeyCode {
+  use openharmony_ability::xcomponent::KeyCode::*;
+
+  match keycode {
+    Key0 => KeyCode::Digit0,
+    Key1 => KeyCode::Digit1,
+    Key2 => KeyCode::Digit2,
+    Key3 => KeyCode::Digit3,
+    Key4 => KeyCode::Digit4,
+    Key5 => KeyCode::Digit5,
+    Key6 => KeyCode::Digit6,
+    Key7 => KeyCode::Digit7,
+    Key8 => KeyCode::Digit8,
+    Key9 => KeyCode::Digit9,
+    A => KeyCode::KeyA,
+    B => KeyCode::KeyB,
+    C => KeyCode::KeyC,
+    D => KeyCode::KeyD,
+    E => KeyCode::KeyE,
+    F => KeyCode::KeyF,
+    G => KeyCode::KeyG,
+    H => KeyCode::KeyH,
+    I => KeyCode::KeyI,
+    J => KeyCode::KeyJ,
+    K => KeyCode::KeyK,
+    L => KeyCode::KeyL,
+    M => KeyCode::KeyM,
+    N => KeyCode::KeyN,
+    O => KeyCode::KeyO,
+    P => KeyCode::KeyP,
+    Q => KeyCode::KeyQ,
+    R => KeyCode::KeyR,
+    S => KeyCode::KeyS,
+    T => KeyCode::KeyT,
+    U => KeyCode::KeyU,
+    V => KeyCode::KeyV,
+    W => KeyCode::KeyW,
+    X => KeyCode::KeyX,
+    Y => KeyCode::KeyY,
+    Z => KeyCode::KeyZ,
+    Comma => KeyCode::Comma,
+    Period => KeyCode::Period,
+    Grave => KeyCode::Backquote,
+    Minus => KeyCode::Minus,
+    Equals => KeyCode::Equal,
+    LeftBracket => KeyCode::BracketLeft,
+    RightBracket => KeyCode::BracketRight,
+    Backslash => KeyCode::Backslash,
+    Semicolon => KeyCode::Semicolon,
+    Apostrophe => KeyCode::Quote,
+    Slash => KeyCode::Slash,
+    Space => KeyCode::Space,
+    Enter => KeyCode::Enter,
+    Del => KeyCode::Backspace,
+    Tab => KeyCode::Tab,
+    Escape => KeyCode::Escape,
+    ForwardDel => KeyCode::Delete,
+    Insert => KeyCode::Insert,
+    MoveHome => KeyCode::Home,
+    MoveEnd => KeyCode::End,
+    PageUp => KeyCode::PageUp,
+    PageDown => KeyCode::PageDown,
+    CapsLock => KeyCode::CapsLock,
+    ScrollLock => KeyCode::ScrollLock,
+    NumLock => KeyCode::NumLock,
+    // D-pad arrows (device-verified: the pre-completion build reported
+    // Unidentified(Ohos(2012/2013)) for real arrow presses).
+    DpadUp => KeyCode::ArrowUp,
+    DpadDown => KeyCode::ArrowDown,
+    DpadLeft => KeyCode::ArrowLeft,
+    DpadRight => KeyCode::ArrowRight,
+    // Media / volume keys (Camera has no tao KeyCode variant — stays
+    // Unidentified(native); Power is mapped below with the completion set).
+    VolumeUp => KeyCode::AudioVolumeUp,
+    VolumeDown => KeyCode::AudioVolumeDown,
+    VolumeMute => KeyCode::AudioVolumeMute,
+    MediaPlayPause => KeyCode::MediaPlayPause,
+    Home => KeyCode::BrowserHome,
+    Back => KeyCode::BrowserBack,
+    // Full keycode-table completion (issue #109 follow-up audit, 2026-09-11):
+    // every remaining OHOS variant that has a direct tao KeyCode counterpart.
+    // Cross-table name notes: OHOS MediaNext/MediaPrevious → tao MediaTrack*;
+    // SysRq/Break → PrintScreen/Pause; Sleep/Wakeup → Sleep/WakeUp;
+    // KatakanaHiragana → KanaMode (the combined JIS key, per its doc);
+    // ZenkakuHankaku → Lang5 (doc: "Japanese word-processing: Zenkaku/Hankaku");
+    // Menu → ContextMenu; Calc → LaunchApp2 (doc: "labelled Calculator");
+    // Star/Pound → NumpadStar/NumpadHash (phone/remote * and #);
+    // NumpadLeftParen/RightParen → NumpadParenLeft/Right; Power → Power.
+    // NOT mappable (tao KeyCode has no variant; logical Key may still map):
+    // Explorer/Calendar/Spreadsheet/WordProcessor (Launch*), MediaPlay/Pause/
+    // Rewind/FastForward/Close/Record, Redo, Brightness*, ZoomIn/Out, New/
+    // Exit/Save/SpellCheck, Camera, DpadCenter, Sym — these stay
+    // Unidentified(native), which still carries the raw OHOS code. TV/remote
+    // codes (Red/Green/Blue/Yellow, Channel*, TV/VCR/DVD, …) likewise.
+    SysRq => KeyCode::PrintScreen,
+    Break => KeyCode::Pause,
+    Function => KeyCode::Fn,
+    Power => KeyCode::Power,
+    Sleep => KeyCode::Sleep,
+    Wakeup => KeyCode::WakeUp,
+    Forward => KeyCode::BrowserForward,
+    Refresh => KeyCode::BrowserRefresh,
+    Bookmarks => KeyCode::BrowserFavorites,
+    Menu => KeyCode::ContextMenu,
+    Cut => KeyCode::Cut,
+    Copy => KeyCode::Copy,
+    Paste => KeyCode::Paste,
+    Undo => KeyCode::Undo,
+    Envelope => KeyCode::LaunchMail,
+    Calc => KeyCode::LaunchApp2,
+    MediaStop => KeyCode::MediaStop,
+    MediaNext => KeyCode::MediaTrackNext,
+    MediaPrevious => KeyCode::MediaTrackPrevious,
+    MediaEject => KeyCode::Eject,
+    Help => KeyCode::Help,
+    Star => KeyCode::NumpadStar,
+    Pound => KeyCode::NumpadHash,
+    NumpadLeftParen => KeyCode::NumpadParenLeft,
+    NumpadRightParen => KeyCode::NumpadParenRight,
+    // JIS / ISO physical keys (logical Key has no variants — physical
+    // identity is still lossless and correct).
+    Yen => KeyCode::IntlYen,
+    Ro => KeyCode::IntlRo,
+    Key102nd => KeyCode::IntlBackslash,
+    Muhenkan => KeyCode::NonConvert,
+    Henkan => KeyCode::Convert,
+    KatakanaHiragana => KeyCode::KanaMode,
+    ZenkakuHankaku => KeyCode::Lang5,
+    // USB HID / Sun extension keys present on some desktop keyboards.
+    Open => KeyCode::Open,
+    Find => KeyCode::Find,
+    Again => KeyCode::Again,
+    Props => KeyCode::Props,
+    F1 => KeyCode::F1,
+    F2 => KeyCode::F2,
+    F3 => KeyCode::F3,
+    F4 => KeyCode::F4,
+    F5 => KeyCode::F5,
+    F6 => KeyCode::F6,
+    F7 => KeyCode::F7,
+    F8 => KeyCode::F8,
+    F9 => KeyCode::F9,
+    F10 => KeyCode::F10,
+    F11 => KeyCode::F11,
+    F12 => KeyCode::F12,
+    AltLeft => KeyCode::AltLeft,
+    AltRight => KeyCode::AltRight,
+    ShiftLeft => KeyCode::ShiftLeft,
+    ShiftRight => KeyCode::ShiftRight,
+    CtrlLeft => KeyCode::ControlLeft,
+    CtrlRight => KeyCode::ControlRight,
+    MetaLeft => KeyCode::SuperLeft,
+    MetaRight => KeyCode::SuperRight,
+    Numpad0 => KeyCode::Numpad0,
+    Numpad1 => KeyCode::Numpad1,
+    Numpad2 => KeyCode::Numpad2,
+    Numpad3 => KeyCode::Numpad3,
+    Numpad4 => KeyCode::Numpad4,
+    Numpad5 => KeyCode::Numpad5,
+    Numpad6 => KeyCode::Numpad6,
+    Numpad7 => KeyCode::Numpad7,
+    Numpad8 => KeyCode::Numpad8,
+    Numpad9 => KeyCode::Numpad9,
+    NumpadDivide => KeyCode::NumpadDivide,
+    NumpadMultiply => KeyCode::NumpadMultiply,
+    NumpadSubtract => KeyCode::NumpadSubtract,
+    NumpadAdd => KeyCode::NumpadAdd,
+    NumpadDot => KeyCode::NumpadDecimal,
+    NumpadComma => KeyCode::NumpadComma,
+    NumpadEnter => KeyCode::NumpadEnter,
+    NumpadEquals => KeyCode::NumpadEqual,
+    _ => KeyCode::Unidentified(NativeKeyCode::Ohos(i32::from(keycode))),
+  }
+}
+
 pub fn to_location(keycode: Keycode) -> KeyLocation {
   use openharmony_ability::xcomponent::KeyCode::*;
 
@@ -416,7 +609,10 @@ mod tests {
     assert!(matches!(to_logical(MediaNext), Key::MediaTrackNext));
     assert!(matches!(to_logical(MediaPrevious), Key::MediaTrackPrevious));
     assert!(matches!(to_logical(MediaRewind), Key::MediaRewind));
-    assert!(matches!(to_logical(MediaFastForward), Key::MediaFastForward));
+    assert!(matches!(
+      to_logical(MediaFastForward),
+      Key::MediaFastForward
+    ));
     assert!(matches!(to_logical(MediaPlay), Key::MediaPlay));
     assert!(matches!(to_logical(MediaPause), Key::MediaPause));
     assert!(matches!(to_logical(MediaClose), Key::MediaClose));
@@ -601,7 +797,10 @@ mod tests {
     assert!(matches!(to_logical(ZenkakuHankaku), Key::ZenkakuHankaku));
     assert!(matches!(to_logical(Muhenkan), Key::NonConvert));
     assert!(matches!(to_logical(Henkan), Key::Convert));
-    assert!(matches!(to_logical(KatakanaHiragana), Key::HiraganaKatakana));
+    assert!(matches!(
+      to_logical(KatakanaHiragana),
+      Key::HiraganaKatakana
+    ));
   }
 
   // ─── to_logical: calendar & sleep ────────────────────────────────────
@@ -631,51 +830,83 @@ mod tests {
   }
 
   #[test]
-  fn to_logical_numpad_keys_are_unidentified() {
-    // Numpad digits and operators map to Unidentified (no web numpad mapping)
-    for kc in [
-      Numpad0, Numpad1, Numpad2, Numpad3, Numpad4,
-      Numpad5, Numpad6, Numpad7, Numpad8, Numpad9,
-    ] {
-      assert!(matches!(to_logical(kc), Key::Unidentified(_)), "numpad digit should be Unidentified");
+  fn to_logical_numpad_keys_map_characters() {
+    // Numpad digits/operators map to their produced character (NumLock on);
+    // to_location still reports KeyLocation::Numpad for disambiguation.
+    let cases = [
+      (Numpad0, "0"),
+      (Numpad1, "1"),
+      (Numpad2, "2"),
+      (Numpad3, "3"),
+      (Numpad4, "4"),
+      (Numpad5, "5"),
+      (Numpad6, "6"),
+      (Numpad7, "7"),
+      (Numpad8, "8"),
+      (Numpad9, "9"),
+      (NumpadDivide, "/"),
+      (NumpadMultiply, "*"),
+      (NumpadSubtract, "-"),
+      (NumpadAdd, "+"),
+      (NumpadDot, "."),
+      (NumpadComma, ","),
+      (NumpadEquals, "="),
+      (NumpadLeftParen, "("),
+      (NumpadRightParen, ")"),
+    ];
+    for (kc, expected) in cases {
+      assert!(
+        matches!(to_logical(kc), Key::Character(ref c) if *c == expected),
+        "numpad key {kc:?} should map to Character({expected:?})"
+      );
     }
-    assert!(matches!(to_logical(NumpadDivide), Key::Unidentified(_)));
-    assert!(matches!(to_logical(NumpadMultiply), Key::Unidentified(_)));
-    assert!(matches!(to_logical(NumpadSubtract), Key::Unidentified(_)));
-    assert!(matches!(to_logical(NumpadAdd), Key::Unidentified(_)));
-    assert!(matches!(to_logical(NumpadDot), Key::Unidentified(_)));
-    assert!(matches!(to_logical(NumpadComma), Key::Unidentified(_)));
-    assert!(matches!(to_logical(NumpadEnter), Key::Unidentified(_)));
-    assert!(matches!(to_logical(NumpadEquals), Key::Unidentified(_)));
-    assert!(matches!(to_logical(NumpadLeftParen), Key::Unidentified(_)));
-    assert!(matches!(to_logical(NumpadRightParen), Key::Unidentified(_)));
+    assert!(matches!(to_logical(NumpadEnter), Key::Enter));
   }
 
   #[test]
-  fn to_logical_alpha_keys_are_unidentified_fallback() {
-    // A-Z and 0-9 keys are matched as Unidentified (they should be resolved
-    // via KeyMapChar::Unicode first, but this is a fallback)
-    assert!(matches!(to_logical(A), Key::Unidentified(_)));
-    assert!(matches!(to_logical(Z), Key::Unidentified(_)));
-    assert!(matches!(to_logical(Key0), Key::Unidentified(_)));
-    assert!(matches!(to_logical(Key9), Key::Unidentified(_)));
+  fn to_logical_alpha_keys_map_characters() {
+    // Letters/digits map to their base (unshifted) character — issue #109:
+    // the Android-style Unicode path doesn't exist on the OHOS NDK, so the
+    // keycode mapping is the only source.
+    let cases = [
+      (A, "a"),
+      (Z, "z"),
+      (Key0, "0"),
+      (Key9, "9"),
+      (Star, "*"),
+      (Pound, "#"),
+    ];
+    for (kc, expected) in cases {
+      assert!(
+        matches!(to_logical(kc), Key::Character(ref c) if *c == expected),
+        "key {kc:?} should map to Character({expected:?})"
+      );
+    }
   }
 
   #[test]
-  fn to_logical_punctuation_keys_are_unidentified_fallback() {
-    assert!(matches!(to_logical(Comma), Key::Unidentified(_)));
-    assert!(matches!(to_logical(Period), Key::Unidentified(_)));
-    assert!(matches!(to_logical(Grave), Key::Unidentified(_)));
-    assert!(matches!(to_logical(Minus), Key::Unidentified(_)));
-    assert!(matches!(to_logical(Equals), Key::Unidentified(_)));
-    assert!(matches!(to_logical(LeftBracket), Key::Unidentified(_)));
-    assert!(matches!(to_logical(RightBracket), Key::Unidentified(_)));
-    assert!(matches!(to_logical(Backslash), Key::Unidentified(_)));
-    assert!(matches!(to_logical(Semicolon), Key::Unidentified(_)));
-    assert!(matches!(to_logical(Apostrophe), Key::Unidentified(_)));
-    assert!(matches!(to_logical(Slash), Key::Unidentified(_)));
-    assert!(matches!(to_logical(At), Key::Unidentified(_)));
-    assert!(matches!(to_logical(Plus), Key::Unidentified(_)));
+  fn to_logical_punctuation_keys_map_characters() {
+    let cases = [
+      (Comma, ","),
+      (Period, "."),
+      (Grave, "`"),
+      (Minus, "-"),
+      (Equals, "="),
+      (LeftBracket, "["),
+      (RightBracket, "]"),
+      (Backslash, "\\"),
+      (Semicolon, ";"),
+      (Apostrophe, "'"),
+      (Slash, "/"),
+      (At, "@"),
+      (Plus, "+"),
+    ];
+    for (kc, expected) in cases {
+      assert!(
+        matches!(to_logical(kc), Key::Character(ref c) if *c == expected),
+        "key {kc:?} should map to Character({expected:?})"
+      );
+    }
   }
 
   #[test]
@@ -710,13 +941,33 @@ mod tests {
   #[test]
   fn to_location_numpad_keys() {
     for kc in [
-      NumLock, Numpad0, Numpad1, Numpad2, Numpad3, Numpad4,
-      Numpad5, Numpad6, Numpad7, Numpad8, Numpad9,
-      NumpadDivide, NumpadMultiply, NumpadSubtract, NumpadAdd,
-      NumpadDot, NumpadComma, NumpadEnter, NumpadEquals,
-      NumpadLeftParen, NumpadRightParen,
+      NumLock,
+      Numpad0,
+      Numpad1,
+      Numpad2,
+      Numpad3,
+      Numpad4,
+      Numpad5,
+      Numpad6,
+      Numpad7,
+      Numpad8,
+      Numpad9,
+      NumpadDivide,
+      NumpadMultiply,
+      NumpadSubtract,
+      NumpadAdd,
+      NumpadDot,
+      NumpadComma,
+      NumpadEnter,
+      NumpadEquals,
+      NumpadLeftParen,
+      NumpadRightParen,
     ] {
-      assert_eq!(to_location(kc), KeyLocation::Numpad, "numpad key should be Numpad location");
+      assert_eq!(
+        to_location(kc),
+        KeyLocation::Numpad,
+        "numpad key should be Numpad location"
+      );
     }
   }
 
@@ -724,10 +975,112 @@ mod tests {
   fn to_location_non_modifier_non_numpad_is_standard() {
     // Regular keys (letters, digits, F-keys, arrows, etc.) are Standard
     for kc in [
-      A, B, Key0, Key9, F1, F12, DpadUp, DpadDown,
-      Space, Tab, Enter, Escape, VolumeUp, Home, PageUp,
+      A, B, Key0, Key9, F1, F12, DpadUp, DpadDown, Space, Tab, Enter, Escape, VolumeUp, Home,
+      PageUp,
     ] {
-      assert_eq!(to_location(kc), KeyLocation::Standard, "regular key should be Standard location");
+      assert_eq!(
+        to_location(kc),
+        KeyLocation::Standard,
+        "regular key should be Standard location"
+      );
     }
+  }
+
+  // ─── to_physical: physical KeyCode mapping (issue #109) ─────────────────
+
+  #[test]
+  fn to_physical_letters_digits_and_punctuation() {
+    assert_eq!(to_physical(A), KeyCode::KeyA);
+    assert_eq!(to_physical(Z), KeyCode::KeyZ);
+    assert_eq!(to_physical(Key0), KeyCode::Digit0);
+    assert_eq!(to_physical(Key9), KeyCode::Digit9);
+    assert_eq!(to_physical(Grave), KeyCode::Backquote);
+    assert_eq!(to_physical(Apostrophe), KeyCode::Quote);
+    assert_eq!(to_physical(Equals), KeyCode::Equal);
+    assert_eq!(to_physical(Del), KeyCode::Backspace);
+    assert_eq!(to_physical(MoveHome), KeyCode::Home);
+  }
+
+  #[test]
+  fn to_physical_modifiers_have_left_right_identity() {
+    assert_eq!(to_physical(AltLeft), KeyCode::AltLeft);
+    assert_eq!(to_physical(AltRight), KeyCode::AltRight);
+    assert_eq!(to_physical(ShiftLeft), KeyCode::ShiftLeft);
+    assert_eq!(to_physical(ShiftRight), KeyCode::ShiftRight);
+    assert_eq!(to_physical(CtrlLeft), KeyCode::ControlLeft);
+    assert_eq!(to_physical(CtrlRight), KeyCode::ControlRight);
+    assert_eq!(to_physical(MetaLeft), KeyCode::SuperLeft);
+    assert_eq!(to_physical(MetaRight), KeyCode::SuperRight);
+  }
+
+  #[test]
+  fn to_physical_numpad_keys() {
+    assert_eq!(to_physical(Numpad0), KeyCode::Numpad0);
+    assert_eq!(to_physical(Numpad9), KeyCode::Numpad9);
+    assert_eq!(to_physical(NumpadEnter), KeyCode::NumpadEnter);
+    assert_eq!(to_physical(NumpadDot), KeyCode::NumpadDecimal);
+    assert_eq!(to_physical(NumpadEquals), KeyCode::NumpadEqual);
+    assert_eq!(to_physical(NumpadDivide), KeyCode::NumpadDivide);
+  }
+
+  #[test]
+  fn to_physical_arrows_and_media_keys() {
+    // Device-verified gap fill (2026-09-11): real arrow presses arrived as
+    // Unidentified(Ohos(2012/2013)) before these mappings existed.
+    assert_eq!(to_physical(DpadUp), KeyCode::ArrowUp);
+    assert_eq!(to_physical(DpadDown), KeyCode::ArrowDown);
+    assert_eq!(to_physical(DpadLeft), KeyCode::ArrowLeft);
+    assert_eq!(to_physical(DpadRight), KeyCode::ArrowRight);
+    assert_eq!(to_physical(VolumeDown), KeyCode::AudioVolumeDown);
+    assert_eq!(to_physical(VolumeUp), KeyCode::AudioVolumeUp);
+    assert_eq!(to_physical(VolumeMute), KeyCode::AudioVolumeMute);
+    assert_eq!(to_physical(MediaPlayPause), KeyCode::MediaPlayPause);
+    assert_eq!(to_physical(Home), KeyCode::BrowserHome);
+    assert_eq!(to_physical(Back), KeyCode::BrowserBack);
+  }
+
+  #[test]
+  fn to_physical_completion_set() {
+    // Cross-table name remaps from the 2026-09-11 full-table audit.
+    assert_eq!(to_physical(SysRq), KeyCode::PrintScreen);
+    assert_eq!(to_physical(Break), KeyCode::Pause);
+    assert_eq!(to_physical(Function), KeyCode::Fn);
+    assert_eq!(to_physical(Sleep), KeyCode::Sleep);
+    assert_eq!(to_physical(Wakeup), KeyCode::WakeUp);
+    assert_eq!(to_physical(MediaNext), KeyCode::MediaTrackNext);
+    assert_eq!(to_physical(MediaPrevious), KeyCode::MediaTrackPrevious);
+    assert_eq!(to_physical(MediaEject), KeyCode::Eject);
+    assert_eq!(to_physical(Envelope), KeyCode::LaunchMail);
+    assert_eq!(to_physical(Menu), KeyCode::ContextMenu);
+    assert_eq!(to_physical(Star), KeyCode::NumpadStar);
+    assert_eq!(to_physical(Pound), KeyCode::NumpadHash);
+    assert_eq!(to_physical(NumpadLeftParen), KeyCode::NumpadParenLeft);
+    assert_eq!(to_physical(NumpadRightParen), KeyCode::NumpadParenRight);
+    // JIS / ISO.
+    assert_eq!(to_physical(Yen), KeyCode::IntlYen);
+    assert_eq!(to_physical(Ro), KeyCode::IntlRo);
+    assert_eq!(to_physical(Key102nd), KeyCode::IntlBackslash);
+    assert_eq!(to_physical(Muhenkan), KeyCode::NonConvert);
+    assert_eq!(to_physical(Henkan), KeyCode::Convert);
+    assert_eq!(to_physical(KatakanaHiragana), KeyCode::KanaMode);
+    assert_eq!(to_physical(ZenkakuHankaku), KeyCode::Lang5);
+    // Sun / HID extension keys.
+    assert_eq!(to_physical(Open), KeyCode::Open);
+    assert_eq!(to_physical(Find), KeyCode::Find);
+    assert_eq!(to_physical(Again), KeyCode::Again);
+    assert_eq!(to_physical(Props), KeyCode::Props);
+    assert_eq!(to_physical(Undo), KeyCode::Undo);
+    assert_eq!(to_physical(Copy), KeyCode::Copy);
+    assert_eq!(to_physical(Bookmarks), KeyCode::BrowserFavorites);
+    assert_eq!(to_physical(Calc), KeyCode::LaunchApp2);
+  }
+
+  #[test]
+  fn to_physical_unmapped_falls_back_to_native_unidentified() {
+    // Keys without a tao KeyCode mapping keep the raw OHOS code attached.
+    assert!(matches!(
+      to_physical(Unknown),
+      KeyCode::Unidentified(NativeKeyCode::Ohos(_))
+    ));
   }
 }

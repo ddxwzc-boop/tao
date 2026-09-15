@@ -1227,8 +1227,12 @@ impl Window {
   /// ## Platform-specific
   ///
   /// - **iOS / Android / Linux:** Unsupported.
+  /// - **OHOS:** Implemented via `OH_WindowManager_SetWindowPrivacyMode` (API
+  ///   15+); the window's content is excluded from screenshots, recording, and
+  ///   casting. Requires `ohos.permission.PRIVACY_WINDOW` declared in the app's
+  ///   entry module.
   pub fn set_content_protection(&self, #[allow(unused)] enabled: bool) {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_env = "ohos"))]
     self.window.set_content_protection(enabled);
   }
 

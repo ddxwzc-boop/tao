@@ -7,19 +7,21 @@
 //   run_loop dispatch, theme/cursor/monitor shared helpers.
 // - `window`: Window (builder attrs → setters → drop), WindowId, the
 //   windowStatusChange state mirror registry, scancode stubs.
-// - `decor_watch`: the per-window set_inner_size decor self-correction task.
-// - `monitor`: MonitorHandle/VideoMode (single-display device).
+// - `monitor`: MonitorHandle/VideoMode — per-display handles over the
+//   openharmony-ability display enumeration (multi-display, issue #106).
 // - `keycodes`: OHOS keycode → tao Key/KeyLocation mapping.
+//
+// NOTE: the former `decor_watch` module (per-window set_inner_size decor
+// self-correction) was removed by issue Eulogizethesun/tauri#97 — set_inner_size
+// now dispatches through the precise ArkTS-side `resize-inner` bridge call
+// (getWindowProperties snapshot) and needs no post-hoc correction.
 
-mod decor_watch;
 mod event_loop;
 mod keycodes;
 mod monitor;
 mod window;
 
-pub use event_loop::{
-  DeviceId, EventLoop, EventLoopProxy, EventLoopWindowTarget, KeyEventExtra,
-};
+pub use event_loop::{DeviceId, EventLoop, EventLoopProxy, EventLoopWindowTarget, KeyEventExtra};
 pub use monitor::{MonitorHandle, VideoMode};
 pub use window::{
   keycode_from_scancode, keycode_to_scancode, OHOSWindowKind, OsError,

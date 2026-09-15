@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::Arc;
 
-use openharmony_ability::window::{create_os_window, WindowCreateParams, set_cursor_grab};
+use openharmony_ability::window::{
+  create_os_window, set_cursor_grab, set_window_privacy_mode, WindowCreateParams,
+};
 use openharmony_ability::{Configuration, OpenHarmonyApp, Rect};
 use openharmony_ability_plugin_window::WindowExt;
 
@@ -12,10 +14,9 @@ use crate::keyboard::{KeyCode, NativeKeyCode};
 use crate::monitor;
 use crate::window::{self, Fullscreen, ResizeDirection, Theme, WindowSizeConstraints};
 
-use super::decor_watch::{DecorWatchHandle, DecorWatchMsg, run_decor_watch};
 use super::event_loop::{
-  cursor_position_from_app, monitor_from_point_for_app, set_app_theme, BridgeExecutor,
-  EventLoopWindowTarget, HAS_FOCUS, APP_THEME_OVERRIDE, THEME_OVERRIDE_DARK, THEME_OVERRIDE_LIGHT,
+  cursor_position_from_app, effective_theme, monitor_from_point_for_app, set_app_theme,
+  BridgeExecutor, EventLoopWindowTarget, HAS_FOCUS,
 };
 use super::monitor::MonitorHandle;
 
@@ -65,7 +66,8 @@ const FLAG_CLOSABLE: u8 = 1;
 const FLAG_MAXIMIZABLE: u8 = 2;
 const FLAG_MINIMIZABLE: u8 = 4;
 const FLAG_RESIZABLE: u8 = 8;
-const FLAG_ALL_DECORATIONS: u8 = FLAG_CLOSABLE | FLAG_MAXIMIZABLE | FLAG_MINIMIZABLE | FLAG_RESIZABLE;
+const FLAG_ALL_DECORATIONS: u8 =
+  FLAG_CLOSABLE | FLAG_MAXIMIZABLE | FLAG_MINIMIZABLE | FLAG_RESIZABLE;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlatformSpecificWindowBuilderAttributes {
@@ -156,28 +158,21 @@ impl WindowStateMirror {
 /// through this registry / window ids.
 pub(crate) static WINDOW_MIRRORS: std::sync::LazyLock<
   std::sync::Mutex<std::collections::HashMap<i64, std::sync::Weak<WindowStateMirror>>>,
-> = std::sync::LazyLock::new(|| {
-  std::sync::Mutex::new(std::collections::HashMap::new())
-});
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 pub(crate) struct Window {
   app: OpenHarmonyApp,
   window_id: Option<i64>,
-  /// Window kind (UIAbility/Float). The title-bar-height compensation in
-  /// set_inner_size only applies to UIAbility — app.window_rect()/content_rect()
-  /// is a single Rect on the shared OpenHarmonyApp, reflecting only the main
-  /// window; Float sub-windows have no system title bar (FloatPage ships its own
-  /// UI title bar), so applying the main window's decor_height would mismatch,
-  /// hence Float skips the compensation (G7).
-  kind: OHOSWindowKind,
+  /// Window kind resolution happens at creation (local `kind` in `new()`).
+  /// Historically a field driving the set_inner_size title-bar compensation
+  /// (Float skipped it — G7); since issue Eulogizethesun/tauri#97 the
+  /// compensation is computed per-window on the ArkTS side from the window's
+  /// own `getWindowProperties()` snapshot (Float windows get chrome 0
+  /// automatically), so no per-window kind state is needed anymore.
   /// Bridge facade for async window operations (None when bridge is not ready).
   window_client: Option<openharmony_ability_plugin_window::WindowClient>,
   /// Background runtime handle for spawning async bridge calls.
   runtime: BridgeExecutor,
-  /// Lazily-created per-window decor watcher (see `run_decor_watch`): one
-  /// long-lived task + one decor-change callback per window, driven by events
-  /// instead of a timer. Mutex<Option<..>> because set_inner_size takes &self.
-  decor_watch: Arc<Mutex<Option<DecorWatchHandle>>>,
   /// Shared state mirror (see [`WindowStateMirror`]): the event loop drain
   /// applies system truth to it through [`WINDOW_MIRRORS`] without owning
   /// this window.
@@ -230,7 +225,7 @@ enum OHOSWindowType {
   TypeSystemAlert = 1,
   TypeFloat = 8,
   TypeDialog = 16,
-  TypeMain = 32
+  TypeMain = 32,
 }
 
 /// OHOS `WindowStatusType` (API 11+) — the system's window mode, reported via
@@ -273,7 +268,10 @@ impl From<i32> for WindowStatus {
 /// HORIZONTAL_TEXT_CURSOR=39, LOADING=42.
 fn ohos_pointer_style(icon: window::CursorIcon) -> i32 {
   match icon {
-    window::CursorIcon::Default | window::CursorIcon::Arrow | window::CursorIcon::ContextMenu | window::CursorIcon::Cell => 0,
+    window::CursorIcon::Default
+    | window::CursorIcon::Arrow
+    | window::CursorIcon::ContextMenu
+    | window::CursorIcon::Cell => 0,
     window::CursorIcon::Crosshair => 13,
     window::CursorIcon::Hand => 19,
     window::CursorIcon::Move | window::CursorIcon::AllScroll => 21,
@@ -398,7 +396,11 @@ impl Window {
       match create_os_window(params) {
         Ok(id) => Some(id),
         Err(e) => {
-          log::error!("[tao-ohos] create_os_window failed for Float window {:?}: {:?}", label, e);
+          log::error!(
+            "[tao-ohos] create_os_window failed for Float window {:?}: {:?}",
+            label,
+            e
+          );
           return Err(os_error!(OsError));
         }
       }
@@ -426,15 +428,14 @@ impl Window {
     // set_min/max_inner_size call): logical → physical via the real scale.
     let scale = el.app.scale() as f64;
     let constraints = window_attrs.inner_size_constraints;
-    let constraint_px = |u: Option<PixelUnit>| u.map(|p| p.to_physical::<u32>(scale).0).unwrap_or(0);
+    let constraint_px =
+      |u: Option<PixelUnit>| u.map(|p| p.to_physical::<u32>(scale).0).unwrap_or(0);
     let win = Self {
       app: el.app.clone(),
       window_id,
-      kind,
       window_client,
       runtime,
       mirror: mirror.clone(),
-      decor_watch: Arc::new(Mutex::new(None)),
       decorations: AtomicBool::new(window_attrs.decorations),
       transparent: window_attrs.transparent,
       always_on_top: AtomicBool::new(false),
@@ -473,9 +474,44 @@ impl Window {
         let client = client.clone();
         win.runtime.spawn(async move {
           if let Err(e) = client.set_window_decorations(0, false).await {
-            log::warn!("[tao-ohos] set_window_decorations failed for window 0: {:?}", e);
+            log::warn!(
+              "[tao-ohos] set_window_decorations failed for window 0: {:?}",
+              e
+            );
           }
         });
+      }
+    }
+
+    // Apply builder-specified content protection at creation time (macOS does
+    // this in its create path; without it, .content_protection(true) had no
+    // effect on OHOS until a later set_content_protection call — issue #115).
+    // Same two-phase shape as Window::set_content_protection below.
+    if window_attrs.content_protection && openharmony_ability::sdk_api_version() >= 15 {
+      if let Some(id) = window_id {
+        if let Some(client) = win.bridge_client("set_content_protection") {
+          win.runtime.spawn(async move {
+            match client.get_real_window_id(id).await {
+              Ok(real_id) => {
+                if let Err(e) = set_window_privacy_mode(real_id as i32, true) {
+                  log::warn!(
+                    "[tao-ohos] initial content protection failed for window {} (real id {}): {}",
+                    id,
+                    real_id,
+                    e
+                  );
+                }
+              }
+              Err(e) => {
+                log::warn!(
+                  "[tao-ohos] initial content protection: get_real_window_id failed for window {}: {:?}",
+                  id,
+                  e
+                );
+              }
+            }
+          });
+        }
       }
     }
 
@@ -498,6 +534,13 @@ impl Window {
   /// constraints entry point (builder attrs in `new`,
   /// `set_inner_size_constraints`, `set_min_inner_size` /
   /// `set_max_inner_size`) updates the cache first and funnels through here.
+  ///
+  /// KNOWN口径 GAP (issue #97 review, pre-existing): OHOS `setWindowLimits`
+  /// constrains the OUTER windowRect, but the values dispatched here are INNER
+  /// sizes — so effective bounds are off by the chrome (146px height on the
+  /// reference PC; e.g. max_inner 700 actually enforces a 554px inner max).
+  /// Follow-up candidate: chrome-compensate on the ArkTS side like
+  /// `resize-inner` does, re-dispatching when the decor changes.
   fn apply_window_limits(&self, window_id: i64) {
     let Some(client) = self.bridge_client("set_window_limits") else {
       return;
@@ -507,8 +550,15 @@ impl Window {
     let max_w = self.max_inner_width.load(Ordering::Acquire) as i64;
     let max_h = self.max_inner_height.load(Ordering::Acquire) as i64;
     self.runtime.spawn(async move {
-      if let Err(e) = client.set_window_limits(window_id, min_w, min_h, max_w, max_h).await {
-        log::warn!("[tao-ohos] set_window_limits failed for window {}: {:?}", window_id, e);
+      if let Err(e) = client
+        .set_window_limits(window_id, min_w, min_h, max_w, max_h)
+        .await
+      {
+        log::warn!(
+          "[tao-ohos] set_window_limits failed for window {}: {:?}",
+          window_id,
+          e
+        );
       }
     });
   }
@@ -520,8 +570,7 @@ impl Window {
 
   #[inline]
   pub fn monitor_from_point(&self, x: f64, y: f64) -> Option<monitor::MonitorHandle> {
-    monitor_from_point_for_app(&self.app, x, y)
-      .map(|inner| monitor::MonitorHandle { inner })
+    monitor_from_point_for_app(&self.app, x, y).map(|inner| monitor::MonitorHandle { inner })
   }
 
   pub fn id(&self) -> WindowId {
@@ -536,31 +585,30 @@ impl Window {
   }
 
   pub fn available_monitors(&self) -> VecDeque<MonitorHandle> {
-    let mut v = VecDeque::with_capacity(1);
-    v.push_back(MonitorHandle::new(self.app.clone()));
-    v
+    // One handle per connected display (issue Eulogizethesun/tauri#106).
+    MonitorHandle::all_for_app(&self.app).into_iter().collect()
   }
 
   pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
-    // Inner (content-area) rect including the decor compensation — computed
-    // inside openharmony-ability under one lock (issue #87 major-10). The
-    // compensation rationale (title-bar inset below/above the content area,
-    // cached decor instead of a live window_rect − content_rect diff) is
-    // documented on `OpenHarmonyApp::inner_rect_for`. Float sub-windows get
-    // decor 0 there (FloatPage ships its own UI bar), same as the former
-    // inline logic; (G7: the mirrored rects track the MAIN window, so this
-    // getter is only meaningful for main/UIAbility windows regardless.)
+    // Inner (content-area) position — computed inside openharmony-ability under
+    // one lock from the system's drawableRect snapshot (issue
+    // Eulogizethesun/tauri#97): window position + drawable offset. Float
+    // sub-windows get offset (0,0) naturally (no system title bar).
+    // (G7: the mirrored rects track the MAIN window, so this getter is only
+    // meaningful for main/UIAbility windows regardless.)
     let rect = self.app.inner_rect_for(self.window_id.unwrap_or(0));
     Ok(PhysicalPosition::new(rect.left, rect.top))
   }
 
   pub fn inner_size(&self) -> PhysicalSize<u32> {
     // D2 hybrid (design.md): OHOS win.resize() sets the OUTER size (including
-    // title bar). inner_size mirrors set_inner_size's compensation (computed in
-    // `OpenHarmonyApp::inner_rect_for`, issue #87 major-10) so save→restore
-    // cycles are idempotent: save inner (= outer − decor) → restore
-    // resize(inner + decor) = outer. Web content sizing is unaffected: the Web
-    // component uses natural layout ("100%"), so it never reads inner_size.
+    // title bar). inner_size reads the system's drawableRect snapshot
+    // (`OpenHarmonyApp::inner_rect_for`, issue Eulogizethesun/tauri#97) so
+    // save→restore cycles are idempotent: save inner (drawableRect) → restore
+    // resize-inner(inner) → the same drawableRect again — zero drift by
+    // construction, both sides using the system's own numbers. Web content
+    // sizing is unaffected: the Web component uses natural layout ("100%"),
+    // so it never reads inner_size.
     let rect = self.app.inner_rect_for(self.window_id.unwrap_or(0));
     PhysicalSize::new(rect.width as _, rect.height.max(0) as u32)
   }
@@ -571,105 +619,39 @@ impl Window {
       log::warn!("[tao-ohos] set_inner_size blocked: FLAG_RESIZABLE not set");
       return;
     }
-    // Compensate for title bar height: OHOS win.resize() sets the OUTER size
-    // (including title bar), but the caller expects INNER size (content area).
-    // decor_height_for does the compensation internally (issue #87 major-10):
-    // the main window gets the cached latched title-bar inset, Float
-    // sub-windows (which ship their own UI title bar) get 0. Without this,
-    // save→restore loops shrink the window by one title bar each cycle
-    // (issue 2: inner/outer semantic mismatch). Width is NOT compensated (the
-    // title bar only affects height).
-    let is_float = self.kind == OHOSWindowKind::Float;
-    let decor_height = self.app.decor_height_for(self.window_id.unwrap_or(0)) as u32;
-    // For LogicalSize, convert via the real scale_factor (a hardcoded 1.0 would
-    // halve the window on DPR≠1 displays). The ArkTS side
-    // (WindowManager.resizeWindow) does NOT compensate — it calls win.resize(w, h)
-    // directly, so the value dispatched here is the outer size.
+    // Issue Eulogizethesun/tauri#97: PRECISE inner sizing. The caller expects
+    // the content area to become this size; OHOS `win.resize()` sets the OUTER
+    // size (including the title bar), so the inner→outer conversion must know
+    // the real chrome. The conversion runs on the ArkTS side at dispatch time
+    // from one atomic `getWindowProperties()` snapshot
+    // (`outer = inner + (windowRect − drawableRect)` per axis) — the system's
+    // own numbers, fresh on every call. This replaces the former estimate
+    // chain (latched decor diff + per-window decor watcher + post-hoc
+    // re-dispatch) whose errors compounded through save/restore cycles into
+    // the shrinking-window bug.
+    //
+    // Deliberate non-goals (per issue #97): no cached decor, no post-hoc
+    // correction — a decor change after dispatch (e.g. runtime menubar
+    // show/hide) is the caller's business; and when the precise chrome cannot
+    // be read (window not created/destroyed, content not loaded) the bridge
+    // call fails and we WARN + SKIP — never resize to a guessed size.
     let s = size.to_physical::<u32>(self.scale_factor());
-    let outer_height = s.height.saturating_add(decor_height);
     if let Some(window_id) = self.window_id {
       let Some(client) = self.bridge_client("set_inner_size") else {
         return;
       };
       let w = s.width as i64;
-      let h = outer_height as i64;
-      if is_float {
-        // Float sub-windows: decor is 0 by design (FloatPage ships its own UI
-        // bar) and app.decor_height() mirrors the MAIN window — a watcher fed
-        // by main-window decor events would mis-correct Float windows by the
-        // main window's title-bar inset (observed 1520x1140 → 1520x1286).
-        // Fire-and-forget, no self-correction.
-        self.runtime.spawn(async move {
-          if let Err(e) = client.resize_window(window_id, w, h).await {
-            log::warn!("[tao-ohos] resize_window failed for window {}: {:?}", window_id, e);
-          }
-        });
-        return;
-      }
-      // UIAbility window: route through the per-window decor watcher so a
-      // dispatch that raced a transient decor estimate (notably window-state
-      // restore on startup, where layout converges to the real decor only
-      // after the webview frontend loads) is self-corrected when the cached
-      // decor converges. See run_decor_watch for the correction/deactivation
-      // rules.
-      let pre_h = self.app.window_rect_for(window_id).height as i64;
-      match self.ensure_decor_watch(window_id) {
-        Some(tx) => {
-          let _ = tx.send(DecorWatchMsg::Dispatch {
-            client,
-            w,
-            req_h: s.height as i64,
-            outer_h: h,
-            pre_h,
-            decor_used: decor_height as i32,
-          });
+      let h = s.height as i64;
+      self.runtime.spawn(async move {
+        if let Err(e) = client.resize_inner_window(window_id, w, h).await {
+          log::warn!(
+            "[tao-ohos] set_inner_size NOT applied for window {}: resize-inner failed (precise decor unavailable): {:?}",
+            window_id,
+            e
+          );
         }
-        None => {
-          // Watcher unavailable (registration failed) — plain dispatch.
-          self.runtime.spawn(async move {
-            if let Err(e) = client.resize_window(window_id, w, h).await {
-              log::warn!("[tao-ohos] resize_window failed for window {}: {:?}", window_id, e);
-            }
-          });
-        }
-      }
+      });
     }
-  }
-
-  /// Lazily create this window's decor watcher (task + decor-change callback)
-  /// on the first correctable set_inner_size call, and return its sender.
-  /// Later calls reuse the existing watcher — one task and one callback per
-  /// window for the window's lifetime, so no per-dispatch accumulation.
-  /// Returns None only when callback registration failed (app RwLock
-  /// poisoned — post-panic only); callers degrade to fire-and-forget.
-  fn ensure_decor_watch(
-    &self,
-    window_id: i64,
-  ) -> Option<tokio::sync::mpsc::UnboundedSender<DecorWatchMsg>> {
-    let mut guard = self.decor_watch.lock().expect("decor_watch poisoned");
-    if let Some(handle) = guard.as_ref() {
-      return Some(handle.tx.clone());
-    }
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    // The callback runs under the app's RwLock write lock — it must stay
-    // lock-free. An unbounded-channel send is exactly that (non-blocking).
-    let tx_for_cb = tx.clone();
-    let cb_id = self.app.register_decor_change_callback(Arc::new(move |decor: i32| {
-      let _ = tx_for_cb.send(DecorWatchMsg::Decor(decor));
-      true // keep registered; removed when the window is dropped
-    }));
-    if cb_id == u64::MAX {
-      // Registration failed (poisoned lock): no callback → the watcher would
-      // never observe decor changes. Don't spawn it.
-      return None;
-    }
-    let app = self.app.clone();
-    let tx_for_watch = tx.clone();
-    self.runtime.spawn(async move {
-      run_decor_watch(app, window_id, tx_for_watch, rx).await;
-    });
-    *guard = Some(DecorWatchHandle { tx: tx.clone(), cb_id });
-    Some(tx)
   }
 
   pub fn set_inner_size_constraints(&self, constraints: WindowSizeConstraints) {
@@ -678,10 +660,18 @@ impl Window {
     // set_min_inner_size/set_max_inner_size (see `apply_window_limits`).
     let scale = self.scale_factor();
     let px = |u: Option<PixelUnit>| u.map(|p| p.to_physical::<u32>(scale).0).unwrap_or(0);
-    self.min_inner_width.store(px(constraints.min_width), Ordering::Release);
-    self.min_inner_height.store(px(constraints.min_height), Ordering::Release);
-    self.max_inner_width.store(px(constraints.max_width), Ordering::Release);
-    self.max_inner_height.store(px(constraints.max_height), Ordering::Release);
+    self
+      .min_inner_width
+      .store(px(constraints.min_width), Ordering::Release);
+    self
+      .min_inner_height
+      .store(px(constraints.min_height), Ordering::Release);
+    self
+      .max_inner_width
+      .store(px(constraints.max_width), Ordering::Release);
+    self
+      .max_inner_height
+      .store(px(constraints.max_height), Ordering::Release);
     if let Some(window_id) = self.window_id {
       self.apply_window_limits(window_id);
     }
@@ -704,7 +694,11 @@ impl Window {
       let y = physical.y as i64;
       self.runtime.spawn(async move {
         if let Err(e) = client.move_window_to(window_id, x, y).await {
-          log::warn!("[tao-ohos] move_window_to failed for window {}: {:?}", window_id, e);
+          log::warn!(
+            "[tao-ohos] move_window_to failed for window {}: {:?}",
+            window_id,
+            e
+          );
         }
       });
     }
@@ -770,7 +764,11 @@ impl Window {
       let title = title.to_string();
       self.runtime.spawn(async move {
         if let Err(e) = client.set_window_title(window_id, title).await {
-          log::warn!("[tao-ohos] set_window_title failed for window {}: {:?}", window_id, e);
+          log::warn!(
+            "[tao-ohos] set_window_title failed for window {}: {:?}",
+            window_id,
+            e
+          );
         }
       });
     }
@@ -798,10 +796,18 @@ impl Window {
         // TODO(A1): replace with AppControlExt::show_ability(env) when A1 adds the action
         self.runtime.spawn(async move {
           if let Err(e) = client.restore_window(window_id).await {
-            log::warn!("[tao-ohos] restore_window failed for window {}: {:?}", window_id, e);
+            log::warn!(
+              "[tao-ohos] restore_window failed for window {}: {:?}",
+              window_id,
+              e
+            );
           }
           if let Err(e) = client.show_window(window_id).await {
-            log::warn!("[tao-ohos] show_window failed for window {}: {:?}", window_id, e);
+            log::warn!(
+              "[tao-ohos] show_window failed for window {}: {:?}",
+              window_id,
+              e
+            );
           }
         });
       } else {
@@ -809,7 +815,11 @@ impl Window {
         // TODO(A1): replace with AppControlExt::hide_ability(env) when A1 adds the action
         self.runtime.spawn(async move {
           if let Err(e) = client.minimize_window(window_id).await {
-            log::warn!("[tao-ohos] minimize_window failed for window {}: {:?}", window_id, e);
+            log::warn!(
+              "[tao-ohos] minimize_window failed for window {}: {:?}",
+              window_id,
+              e
+            );
           }
         });
       }
@@ -818,20 +828,22 @@ impl Window {
 
   pub fn set_focus(&self) {
     if let Some(window_id) = self.window_id {
-      if window_id > 0 {
-        let Some(client) = self.bridge_client("set_focus") else {
-          return;
-        };
-        self.runtime.spawn(async move {
-          if let Err(e) = client.focus_window(window_id).await {
-            log::warn!(
-              "set_focus: focus_window failed for window {}: {:?}",
-              window_id, e
-            );
-          }
-        });
-      }
-      // Main window (window_id = 0): focus is OS-managed, no-op
+      let Some(client) = self.bridge_client("set_focus") else {
+        return;
+      };
+      self.runtime.spawn(async move {
+        if let Err(e) = client.focus_window(window_id).await {
+          log::warn!(
+            "set_focus: focus_window failed for window {}: {:?}",
+            window_id,
+            e
+          );
+        }
+      });
+      // The main window (window_id = 0) is dispatched too — the ArkTS side
+      // routes by kind (issue Eulogizethesun/tauri#105): main window uses
+      // window.shiftAppWindowFocus (11+, works for main/sub windows), Float
+      // sub-windows keep raiseToAppTop (14+, subwindow-only by contract).
     }
   }
 
@@ -845,7 +857,8 @@ impl Window {
           if let Err(e) = client.set_window_focusable(window_id, focusable).await {
             log::warn!(
               "set_focusable: set_window_focusable failed for window {}: {:?}",
-              window_id, e
+              window_id,
+              e
             );
           }
         });
@@ -867,7 +880,8 @@ impl Window {
         if let Err(e) = client.destroy_window(window_id).await {
           log::warn!(
             "close: destroy_window failed for window {}: {:?}",
-            window_id, e
+            window_id,
+            e
           );
         }
       });
@@ -883,15 +897,37 @@ impl Window {
     self.always_on_top.load(Ordering::Acquire)
   }
 
-  // TODO(issue 4): set_resizable/set_minimizable/set_maximizable/set_closable
-  //   nominally control "whether the window can resize/minimize/maximize/close",
-  //   but set_decoration_flag only toggles decoration button visibility
-  //   (FloatPage @LocalStorageProp); it does not block programmatic APIs like
-  //   set_minimized/set_maximized/close/set_inner_size. is_resizable etc. also read
-  //   from the local mirror, returning a false promise. The main window is a
-  //   complete no-op. See doc/OHOS-window-residual-issues.md (issue 4).
+  // TODO(issue 4 residual, partially addressed): set_minimizable/set_maximizable/
+  // set_closable still only control decoration button visibility (Float
+  // @LocalStorageProp) and do not block the programmatic APIs; the main window
+  // is a no-op for them. set_resizable is the exception since issue
+  // Eulogizethesun/tauri#104 — see below. is_resizable etc. still read from the
+  // local mirror. See doc/OHOS-window-residual-issues.md (issue 4).
   pub fn set_resizable(&self, resizable: bool) {
     self.set_decoration_flag(FLAG_RESIZABLE, resizable);
+    // Issue Eulogizethesun/tauri#104: the decoration flag only covers
+    // title-bar button visibility (Float sub-windows; no-op on the main
+    // window) and the programmatic-resize gate (set_inner_size checks
+    // FLAG_RESIZABLE). The actual user-facing switch is edge-drag resizing —
+    // dispatched through the bridge: main (UIAbility) window →
+    // setResizeByDragEnabled (API 14+, effective in free-window state),
+    // Float sub-window → enableDrag (API 20+). Failure is logged and ignored
+    // on API levels without the call (ArkTS guards with a clear error).
+    if let Some(window_id) = self.window_id {
+      let Some(client) = self.bridge_client("set_resizable") else {
+        return;
+      };
+      self.runtime.spawn(async move {
+        if let Err(e) = client.set_resize_by_drag(window_id, resizable).await {
+          log::warn!(
+            "[tao-ohos] set_resize_by_drag({}) failed for window {}: {:?}",
+            resizable,
+            window_id,
+            e
+          );
+        }
+      });
+    }
   }
 
   pub fn set_minimizable(&self, minimizable: bool) {
@@ -913,15 +949,26 @@ impl Window {
   /// log, dispatching via the equivalent `set_window_decoration_flags` action).
   fn set_decoration_flag(&self, flag: u8, on: bool) {
     let mut flags = self.decoration_flags.load(Ordering::Acquire);
-    if on { flags |= flag; } else { flags &= !flag; }
+    if on {
+      flags |= flag;
+    } else {
+      flags &= !flag;
+    }
     self.decoration_flags.store(flags, Ordering::Release);
     if let Some(window_id) = self.window_id {
       let Some(client) = self.bridge_client("set_decoration_flag") else {
         return;
       };
       self.runtime.spawn(async move {
-        if let Err(e) = client.set_window_decoration_flags(window_id, flags as i32).await {
-          log::warn!("[tao-ohos] set_window_decoration_flags failed for window {}: {:?}", window_id, e);
+        if let Err(e) = client
+          .set_window_decoration_flags(window_id, flags as i32)
+          .await
+        {
+          log::warn!(
+            "[tao-ohos] set_window_decoration_flags failed for window {}: {:?}",
+            window_id,
+            e
+          );
         }
       });
     }
@@ -943,13 +990,21 @@ impl Window {
       if minimized {
         self.runtime.spawn(async move {
           if let Err(e) = client.minimize_window(window_id).await {
-            log::warn!("[tao-ohos] minimize_window failed for window {}: {:?}", window_id, e);
+            log::warn!(
+              "[tao-ohos] minimize_window failed for window {}: {:?}",
+              window_id,
+              e
+            );
           }
         });
       } else {
         self.runtime.spawn(async move {
           if let Err(e) = client.restore_window(window_id).await {
-            log::warn!("[tao-ohos] restore_window failed for window {}: {:?}", window_id, e);
+            log::warn!(
+              "[tao-ohos] restore_window failed for window {}: {:?}",
+              window_id,
+              e
+            );
           }
         });
       }
@@ -976,14 +1031,22 @@ impl Window {
       if maximized {
         self.runtime.spawn(async move {
           if let Err(e) = client.maximize_window(window_id).await {
-            log::warn!("[tao-ohos] maximize_window failed for window {}: {:?}", window_id, e);
+            log::warn!(
+              "[tao-ohos] maximize_window failed for window {}: {:?}",
+              window_id,
+              e
+            );
           }
         });
       } else {
         // recover() switches MAXIMIZE/FULL_SCREEN → FLOATING (API7+, public)
         self.runtime.spawn(async move {
           if let Err(e) = client.recover_window(window_id).await {
-            log::warn!("[tao-ohos] recover_window failed for window {}: {:?}", window_id, e);
+            log::warn!(
+              "[tao-ohos] recover_window failed for window {}: {:?}",
+              window_id,
+              e
+            );
           }
         });
       }
@@ -1050,7 +1113,11 @@ impl Window {
       };
       self.runtime.spawn(async move {
         if let Err(e) = client.set_window_decorations(window_id, decorations).await {
-          log::warn!("[tao-ohos] set_window_decorations failed for window {}: {:?}", window_id, e);
+          log::warn!(
+            "[tao-ohos] set_window_decorations failed for window {}: {:?}",
+            window_id,
+            e
+          );
         }
       });
     }
@@ -1070,7 +1137,11 @@ impl Window {
       };
       self.runtime.spawn(async move {
         if let Err(e) = client.set_window_topmost(window_id, always_on_top).await {
-          log::warn!("[tao-ohos] set_window_topmost failed for window {}: {:?}", window_id, e);
+          log::warn!(
+            "[tao-ohos] set_window_topmost failed for window {}: {:?}",
+            window_id,
+            e
+          );
         }
       });
     }
@@ -1091,7 +1162,11 @@ impl Window {
       let y = p.y as i64;
       self.runtime.spawn(async move {
         if let Err(e) = client.set_ime_position(window_id, x, y).await {
-          log::warn!("[tao-ohos] set_ime_position failed for window {}: {:?}", window_id, e);
+          log::warn!(
+            "[tao-ohos] set_ime_position failed for window {}: {:?}",
+            window_id,
+            e
+          );
         }
       });
     }
@@ -1137,7 +1212,11 @@ impl Window {
       };
       self.runtime.spawn(async move {
         if let Err(e) = client.set_cursor_icon(window_id, style).await {
-          log::warn!("[tao-ohos] set_cursor_icon failed for window {}: {:?}", window_id, e);
+          log::warn!(
+            "[tao-ohos] set_cursor_icon failed for window {}: {:?}",
+            window_id,
+            e
+          );
         }
       });
     }
@@ -1162,9 +1241,9 @@ impl Window {
         error::NotSupportedError::new(),
       ));
     }
-    let window_id = self.window_id.ok_or_else(|| {
-      error::ExternalError::NotSupported(error::NotSupportedError::new())
-    })?;
+    let window_id = self
+      .window_id
+      .ok_or_else(|| error::ExternalError::NotSupported(error::NotSupportedError::new()))?;
     let client = match &self.window_client {
       Some(c) => c.clone(),
       None => {
@@ -1203,6 +1282,53 @@ impl Window {
     Ok(())
   }
 
+  pub fn set_content_protection(&self, enabled: bool) {
+    // OH_WindowManager_SetWindowPrivacyMode (NDK C API 15+, resolved via
+    // dlopen in openharmony-ability): a privacy-mode window's content is
+    // excluded from screenshots, recording, and casting. Requires
+    // ohos.permission.PRIVACY_WINDOW (normal / system_grant) declared in the
+    // entry module.json5.
+    //
+    // Same D3.7 two-phase shape as set_cursor_grab above: the FFI needs the
+    // REAL OHOS window id, resolved through the window bridge facade, then
+    // invoked fire-and-forget. The public tao API returns `()`, so failures
+    // surface as warnings, not errors.
+    if openharmony_ability::sdk_api_version() < 15 {
+      log::warn!("[tao-ohos] set_content_protection: requires API 15+ (window privacy mode)");
+      return;
+    }
+    let Some(window_id) = self.window_id else {
+      log::warn!("[tao-ohos] set_content_protection: no window id");
+      return;
+    };
+    let Some(client) = self.bridge_client("set_content_protection") else {
+      return;
+    };
+    self.runtime.spawn(async move {
+      match client.get_real_window_id(window_id).await {
+        Ok(real_id) => {
+          if let Err(e) = set_window_privacy_mode(real_id as i32, enabled) {
+            log::warn!(
+              "[tao-ohos] set_content_protection({}) failed for window {} (real id {}): {}",
+              enabled,
+              window_id,
+              real_id,
+              e
+            );
+          }
+        }
+        Err(e) => {
+          log::warn!(
+            "[tao-ohos] set_content_protection({}): get_real_window_id failed for window {}: {:?}",
+            enabled,
+            window_id,
+            e
+          );
+        }
+      }
+    });
+  }
+
   pub fn request_user_attention(&self, _request_type: Option<window::UserAttentionType>) {
     // OHOS window layer has no requestAttention API. Emulated via
     // notificationManager on the ArkTS side (fire-and-forget; the plugin
@@ -1213,7 +1339,11 @@ impl Window {
       };
       self.runtime.spawn(async move {
         if let Err(e) = client.request_user_attention(window_id).await {
-          log::warn!("[tao-ohos] request_user_attention failed for window {}: {:?}", window_id, e);
+          log::warn!(
+            "[tao-ohos] request_user_attention failed for window {}: {:?}",
+            window_id,
+            e
+          );
         }
       });
     }
@@ -1233,9 +1363,9 @@ impl Window {
     // window_id is None for embedded webviews with no OS-level window — cursor-event
     // ignore is genuinely unsupported there, so surface NotSupported (per design D4).
     // Main window (window_id=0) and sub-windows (window_id>0) both proceed.
-    let window_id = self.window_id.ok_or_else(|| {
-      error::ExternalError::NotSupported(error::NotSupportedError::new())
-    })?;
+    let window_id = self
+      .window_id
+      .ok_or_else(|| error::ExternalError::NotSupported(error::NotSupportedError::new()))?;
     // Tauri `ignore=true` (pass events through to windows below) ↔ OHOS `touchable=false`
     // (window does not consume touch/mouse events). The negation lives in this tao layer;
     // the facade client passes `touchable` through verbatim. See design D4 mapping table.
@@ -1341,8 +1471,15 @@ impl Window {
         return;
       };
       self.runtime.spawn(async move {
-        if let Err(e) = client.set_window_background_color(window_id, color_u32).await {
-          log::warn!("[tao-ohos] set_window_background_color failed for window {}: {:?}", window_id, e);
+        if let Err(e) = client
+          .set_window_background_color(window_id, color_u32)
+          .await
+        {
+          log::warn!(
+            "[tao-ohos] set_window_background_color failed for window {}: {:?}",
+            window_id,
+            e
+          );
         }
       });
     }
@@ -1352,20 +1489,10 @@ impl Window {
     // Issue 5, 5.2 theme backfill: read the global override; on FOLLOW fall back to app.config().
     // app.config().color_mode is continuously refreshed by ConfigChanged
     // (onConfigurationUpdated), reflecting system truth — so under FOLLOW mode it
-    // stays in sync with the system without manual backfill.
-    use openharmony_ability::ColorMode;
-    match APP_THEME_OVERRIDE.load(Ordering::Relaxed) {
-      THEME_OVERRIDE_DARK => Theme::Dark,
-      THEME_OVERRIDE_LIGHT => Theme::Light,
-      _ => {
-        // FOLLOW: read system truth.
-        match self.app.config().color_mode {
-          ColorMode::Dark => Theme::Dark,
-          // Light or NoSet (no ConfigChanged received before startup) → Light.
-          _ => Theme::Light,
-        }
-      }
-    }
+    // stays in sync with the system without manual backfill. The same
+    // effective-theme computation also drives the ThemeChanged dispatch in the
+    // ConfigChanged handler (issue Eulogizethesun/tauri#108) — one source, no drift.
+    effective_theme(&self.app)
   }
 
   pub fn set_theme(&self, theme: Option<Theme>) {
@@ -1433,14 +1560,19 @@ impl Window {
   }
 
   pub fn current_monitor(&self) -> Option<monitor::MonitorHandle> {
-    Some(monitor::MonitorHandle {
-      inner: MonitorHandle::new(self.app.clone()),
-    })
+    // Display containing this window's outer-rect top-left (global coordinate
+    // space, kept fresh by the windowRectChange backfill). Falls back to the
+    // primary display when the rect is still unset (before the first callback)
+    // or the point misses every display (issue Eulogizethesun/tauri#106).
+    let rect = self.app.window_rect_for(self.window_id.unwrap_or(0));
+    let handle = MonitorHandle::from_point(&self.app, rect.left as f64, rect.top as f64)
+      .unwrap_or_else(|| MonitorHandle::primary_for_app(&self.app));
+    Some(monitor::MonitorHandle { inner: handle })
   }
 
   pub fn primary_monitor(&self) -> Option<monitor::MonitorHandle> {
     Some(monitor::MonitorHandle {
-      inner: MonitorHandle::new(self.app.clone()),
+      inner: MonitorHandle::primary_for_app(&self.app),
     })
   }
 }
@@ -1456,26 +1588,15 @@ impl Display for OsError {
 }
 
 impl Drop for Window {
-  /// Unregisters the state mirror from [`WINDOW_MIRRORS`] and deregisters the
-  /// decor-change callback. Dropping the handle's sender AND removing the
-  /// callback closure (which holds the other sender) closes the watcher
-  /// channel from both ends, so `run_decor_watch` exits instead of parking
-  /// forever. Windows that never took the correctable set_inner_size path
-  /// (Float sub-windows) have no watcher — the take() is a no-op.
+  /// Unregisters the state mirror from [`WINDOW_MIRRORS`]. (The former
+  /// decor-watcher teardown is gone with the watcher itself — issue
+  /// Eulogizethesun/tauri#97 removed the whole estimation chain.)
   fn drop(&mut self) {
     if let Some(window_id) = self.window_id {
       WINDOW_MIRRORS
         .lock()
         .expect("WINDOW_MIRRORS poisoned")
         .remove(&window_id);
-    }
-    if let Some(handle) = self
-      .decor_watch
-      .lock()
-      .expect("decor_watch poisoned")
-      .take()
-    {
-      self.app.remove_decor_change_callback(handle.cb_id);
     }
   }
 }
@@ -1495,7 +1616,10 @@ mod tests {
   #[test]
   fn rgba_to_ohos_color_transparent_returns_transparent_black() {
     assert_eq!(rgba_to_ohos_color(true, None), Some(0x00000000));
-    assert_eq!(rgba_to_ohos_color(true, Some((255, 0, 0, 255))), Some(0x00000000));
+    assert_eq!(
+      rgba_to_ohos_color(true, Some((255, 0, 0, 255))),
+      Some(0x00000000)
+    );
   }
 
   #[test]
@@ -1505,17 +1629,26 @@ mod tests {
 
   #[test]
   fn rgba_to_ohos_color_packs_argb() {
-    assert_eq!(rgba_to_ohos_color(false, Some((255, 128, 0, 200))), Some(0xC8FF8000));
+    assert_eq!(
+      rgba_to_ohos_color(false, Some((255, 128, 0, 200))),
+      Some(0xC8FF8000)
+    );
   }
 
   #[test]
   fn rgba_to_ohos_color_opaque_white() {
-    assert_eq!(rgba_to_ohos_color(false, Some((255, 255, 255, 255))), Some(0xFFFFFFFF));
+    assert_eq!(
+      rgba_to_ohos_color(false, Some((255, 255, 255, 255))),
+      Some(0xFFFFFFFF)
+    );
   }
 
   #[test]
   fn rgba_to_ohos_color_zero_alpha() {
-    assert_eq!(rgba_to_ohos_color(false, Some((0, 0, 0, 0))), Some(0x00000000));
+    assert_eq!(
+      rgba_to_ohos_color(false, Some((0, 0, 0, 0))),
+      Some(0x00000000)
+    );
   }
 }
 

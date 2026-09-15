@@ -155,6 +155,27 @@ pub enum Event<'a, T: 'static> {
   #[non_exhaustive]
   Reopen { has_visible_windows: bool },
 
+  /// Emitted when the system wants to close the app but the close is still
+  /// cancellable — the PC/2in1 pre-close interception point
+  /// (`UIAbility.onPrepareToTerminateAsync`, requires
+  /// `ohos.permission.PREPARE_APP_TERMINATE`).
+  ///
+  /// Fired BEFORE any teardown for window-close-button / taskbar / tray exits.
+  /// Unlike [`Event::LoopDestroyed`] the handler records its answer on the
+  /// shared slot: `answer.prevent()` (= tauri's `prevent_exit()`) keeps the app
+  /// running — the ArkTS caller cancels the termination — otherwise the system
+  /// proceeds to the normal destroy chain. The reference is only valid for
+  /// the duration of this synchronous dispatch.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony**: only.
+  /// - **Other**: Unsupported.
+  #[cfg(target_env = "ohos")]
+  PrepareToTerminate {
+    answer: &'a openharmony_ability::TerminateAnswer,
+  },
+
   /// Emitted when a scene is requested by the system.
   ///
   /// This event is emitted when a scene is requested by the system.
@@ -197,6 +218,8 @@ impl<T: Clone> Clone for Event<'static, T> {
       } => Reopen {
         has_visible_windows: *has_visible_windows,
       },
+      #[cfg(target_env = "ohos")]
+      PrepareToTerminate { answer } => PrepareToTerminate { answer: *answer },
       #[cfg(target_os = "ios")]
       SceneRequested { scene, options } => SceneRequested {
         scene: scene.clone(),
@@ -226,6 +249,8 @@ impl<'a, T> Event<'a, T> {
       } => Ok(Reopen {
         has_visible_windows,
       }),
+      #[cfg(target_env = "ohos")]
+      PrepareToTerminate { answer } => Ok(PrepareToTerminate { answer }),
       #[cfg(target_os = "ios")]
       SceneRequested { scene, options } => Ok(SceneRequested { scene, options }),
     }
@@ -254,6 +279,10 @@ impl<'a, T> Event<'a, T> {
       } => Some(Reopen {
         has_visible_windows,
       }),
+      // Contains a borrow that cannot be promoted to 'static — the probe's
+      // answer slot only lives for the synchronous dispatch.
+      #[cfg(target_env = "ohos")]
+      PrepareToTerminate { .. } => None,
       #[cfg(target_os = "ios")]
       SceneRequested { scene, options } => Some(SceneRequested { scene, options }),
     }
