@@ -16,7 +16,7 @@ use crate::window::{self, Fullscreen, ResizeDirection, Theme, WindowSizeConstrai
 
 use super::event_loop::{
   cursor_position_from_app, effective_theme, monitor_from_point_for_app, set_app_theme,
-  BridgeExecutor, EventLoopWindowTarget, HAS_FOCUS,
+  BridgeExecutor, EventLoopWindowTarget, HAS_FOCUS, LAST_DISPATCHED_RECTS,
 };
 use super::monitor::MonitorHandle;
 
@@ -513,6 +513,12 @@ impl Window {
           });
         }
       }
+    } else if window_attrs.content_protection
+      && openharmony_ability::sdk_api_version() < 15
+    {
+      log::warn!(
+        "[tao-ohos] builder content_protection(true) skipped: requires API 15+ (window privacy mode)"
+      );
     }
 
     Ok(win)
@@ -535,12 +541,19 @@ impl Window {
   /// `set_inner_size_constraints`, `set_min_inner_size` /
   /// `set_max_inner_size`) updates the cache first and funnels through here.
   ///
-  /// KNOWN SEMANTICS GAP (issue #97 review, pre-existing): OHOS `setWindowLimits`
-  /// constrains the OUTER windowRect, but the values dispatched here are INNER
-  /// sizes — so effective bounds are off by the chrome (146px height on the
-  /// reference PC; e.g. max_inner 700 actually enforces a 554px inner max).
-  /// Follow-up candidate: chrome-compensate on the ArkTS side like
-  /// `resize-inner` does, re-dispatching when the decor changes.
+  /// Inner→outer chrome compensation (review R12, closing the issue #97
+  /// semantics gap): OHOS `setWindowLimits` constrains the OUTER windowRect,
+  /// so the ArkTS "set-limits" action (plugins/window WindowPlugin.ets)
+  /// compensates with the precise system chrome from one
+  /// `getWindowProperties()` snapshot — the same algorithm as `resize-inner`
+  /// (`chrome = windowRect − drawableRect` per axis). Non-zero slots only (0
+  /// = no limit stays 0); Float sub-windows are decorEnabled:false so their
+  /// chrome is 0 by construction; when the main-window snapshot is unreadable
+  /// (e.g. the builder-time dispatch racing content load) the ArkTS side
+  /// degrades to uncompensated inner-sized limits with a WARN instead of
+  /// failing — limits are boundaries, not targets. A decor change after
+  /// dispatch is the caller's business; re-dispatching on decor changes
+  /// remains an open follow-up.
   fn apply_window_limits(&self, window_id: i64) {
     let Some(client) = self.bridge_client("set_window_limits") else {
       return;
@@ -867,10 +880,12 @@ impl Window {
     }
   }
 
-  /// Destroys the OS-level window: Float sub-windows call `destroyWindow`,
-  /// the main (UIAbility) window terminates the ability — the bridge's
-  /// `destroy_window` routes both. Fire-and-forget through the bridge
-  /// executor, same as the other async window operations.
+  /// Destroys the OS-level window: Float sub-windows call `destroyWindow`.
+  /// The main (UIAbility) window is system-managed: the bridge's
+  /// `destroy-window` handler rejects window id 0, so for the main window
+  /// this is a rejected fire-and-forget (logged as a warning) — the ability
+  /// is terminated by the system, not by an in-app close. Fire-and-forget
+  /// through the bridge executor, same as the other async window operations.
   pub fn close(&self) {
     if let Some(window_id) = self.window_id {
       let Some(client) = self.bridge_client("close") else {
@@ -1597,6 +1612,9 @@ impl Drop for Window {
         .lock()
         .expect("WINDOW_MIRRORS poisoned")
         .remove(&window_id);
+      if let Ok(mut rects) = LAST_DISPATCHED_RECTS.lock() {
+        rects.remove(&window_id);
+      }
     }
   }
 }
@@ -1613,6 +1631,14 @@ pub fn keycode_from_scancode(_scancode: u32) -> KeyCode {
 mod tests {
   use super::*;
 
+  // Size regression coverage (set → readback exact equality, float decor=0
+  // readback, save/restore zero drift — run on a DPR ≠ 1 device)
+  // intentionally lives in the api demo device suite
+  // (tauri repo, examples/api/src/lib/tests/window-ops.ts): a cargo test
+  // binary has no UIAbility/ArkTS window, so an ohos `Window` cannot be
+  // constructed outside a bridge session, and the chrome arithmetic itself
+  // sits on the ArkTS side (openharmony-ability WindowPlugin.ets
+  // resize-inner).
   #[test]
   fn rgba_to_ohos_color_transparent_returns_transparent_black() {
     assert_eq!(rgba_to_ohos_color(true, None), Some(0x00000000));

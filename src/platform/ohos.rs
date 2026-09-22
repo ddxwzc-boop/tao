@@ -51,8 +51,9 @@ pub trait WindowExtOpenHarmony {
   /// (e.g. wry's `WebviewClient::from_bridge`).
   fn bridge_runtime(&self) -> openharmony_ability::BridgeRuntime;
 
-  /// Destroys the OS-level window: Float sub-windows call `destroyWindow`,
-  /// the main (UIAbility) window terminates the ability.
+  /// Destroys the OS-level window: Float sub-windows call `destroyWindow`;
+  /// the main (UIAbility) window is system-managed — in-app destroys are
+  /// rejected by the bridge for window id 0.
   ///
   /// Fire-and-forget — the bridge call is spawned on the window's bridge
   /// executor. Recursion-safe against the Float close flow: the synthesized

@@ -45,11 +45,12 @@ const EFFECTIVE_THEME_DARK: u8 = 1;
 const EFFECTIVE_THEME_UNSEEDED: u8 = 2;
 static LAST_EFFECTIVE_THEME: AtomicU8 = AtomicU8::new(EFFECTIVE_THEME_UNSEEDED);
 
-/// Last dispatched outer rect per OHOS window id (left, top, width, height),
-/// used to split windowRectChange events into Moved/Resized (issue
-/// Eulogizethesun/tauri#107). Mutex (not thread_local) because lifecycle
-/// callbacks and the run_loop may dispatch from different threads.
-static LAST_DISPATCHED_RECTS: std::sync::LazyLock<
+/// Last dispatched rect per OHOS window id — (outer left, outer top, INNER
+/// width, inner height; review R11) — used to split windowRectChange events
+/// into Moved/Resized (issue Eulogizethesun/tauri#107). Mutex (not
+/// thread_local) because lifecycle callbacks and the run_loop may dispatch
+/// from different threads.
+pub(crate) static LAST_DISPATCHED_RECTS: std::sync::LazyLock<
   std::sync::Mutex<std::collections::HashMap<i64, (i32, i32, i32, i32)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
@@ -57,8 +58,9 @@ static LAST_DISPATCHED_RECTS: std::sync::LazyLock<
 /// events (the NDK KeyEventData carries no modifier state; issue
 /// Eulogizethesun/tauri#109). Read by the mouse/wheel handlers to populate the
 /// deprecated `modifiers` field, and diffed on every key event to dispatch
-/// `WindowEvent::ModifiersChanged`. Mutex: XComponent input callbacks and the
-/// run_loop focus handlers run on different threads.
+/// `WindowEvent::ModifiersChanged`, and cleared (with ModifiersChanged) on
+/// focus regain (issue Eulogizethesun/tauri#137). Mutex: XComponent input
+/// callbacks and the run_loop focus handlers run on different threads.
 static KEYBOARD_MODIFIERS: std::sync::Mutex<ModifiersState> =
   std::sync::Mutex::new(ModifiersState::empty());
 
@@ -671,6 +673,57 @@ impl<T: 'static> EventLoop<T> {
     }
   }
 
+  /// Handle MainEvent::GainedFocus (app UIAbility stage event,
+  /// StageEventType::ACTIVE — not per-Float-sub-window; window_id = 0, the
+  /// main window): mark focus, clear the tracked modifier set, and dispatch
+  /// Focused(true). Extracted from the run_loop arm for direct testing
+  /// (Review R21 / issue Eulogizethesun/tauri#137).
+  fn handle_gained_focus(
+    event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>,
+  ) {
+    HAS_FOCUS.store(true, Ordering::Relaxed);
+    // Modifier state is tracked from key events (issue #109); a window
+    // that regained focus may have missed modifier releases while
+    // unfocused — start clean rather than trust a stale set.
+    // Review R21 (issue #137): the clear must be observable — when the
+    // tracked set was non-empty, dispatch ModifiersChanged(empty)
+    // BEFORE Focused(true) (same ordering as the Windows backend's
+    // gain_active_focus: update_modifiers precedes Focused; and as
+    // this file's key path: ModifiersChanged precedes the key event).
+    // Without it, event listeners keep the stale set while the
+    // deprecated `modifiers` field on mouse events reads empty.
+    //
+    // The LOST-focus edge deliberately does NOT clear/dispatch
+    // (unlike Windows lose_active_focus / macOS windowDidResignKey):
+    // an INACTIVE window receives no input events, so no stale
+    // modifiers can leak while unfocused, and this regain-side
+    // notification alone restores listener/tao consistency.
+    let had_modifiers = {
+      let mut prev = ModifiersState::empty();
+      if let Ok(mut modifiers) = KEYBOARD_MODIFIERS.lock() {
+        prev = *modifiers;
+        *modifiers = ModifiersState::empty();
+      }
+      !prev.is_empty()
+    };
+    if had_modifiers {
+      call_event_handler!(
+        event_loop_cell,
+        event::Event::WindowEvent {
+          window_id: window::WindowId(WindowId(0)),
+          event: event::WindowEvent::ModifiersChanged(ModifiersState::empty()),
+        }
+      );
+    }
+    call_event_handler!(
+      event_loop_cell,
+      event::Event::WindowEvent {
+        window_id: window::WindowId(WindowId(0)),
+        event: event::WindowEvent::Focused(true),
+      }
+    );
+  }
+
   pub fn run<F>(self, event_handler: F) -> ()
   where
     F: 'static + FnMut(event::Event<T>, &event_loop::EventLoopWindowTarget<T>, &mut ControlFlow),
@@ -800,6 +853,18 @@ impl<T: 'static> EventLoop<T> {
           // Phase 3 (design.md D6): route by the originating window's id instead of
           // the ZST constant. window_id comes from the ArkTS-wrapped options
           // (lifecycle.rs window_resize closure / xcomponent.rs on_surface_changed).
+          //
+          // RESIDUAL GAP (review R11): this arm has MIXED sources with
+          // different metrics and is deliberately left as-is. The XComponent
+          // on_surface_changed path already reports the drawable (inner) area,
+          // while windowSizeChange reports the outer window rect on decorated
+          // windows — routing the payload through inner_rect_for would corrupt
+          // the former (the surface rect may precede the cache update), so
+          // neither is transformed here. tauri apps are unaffected either way
+          // (tauri-runtime-wry re-reads inner_size on every Resized); raw tao
+          // consumers see an outer-sized Resized from the windowSizeChange
+          // source, corrected by the inner-sized ContentRectChange Resized
+          // that follows the same resize.
           let size = PhysicalSize::new(size.width as _, size.height as _);
           call_event_handler!(
             event_loop_cell,
@@ -823,11 +888,6 @@ impl<T: 'static> EventLoop<T> {
           // webview.set_bounds() with the new window dimensions.
           // Phase 3 (design.md D6): route by content_rect.window_id (populated by the
           // window_rect_change lifecycle closure from the ArkTS-wrapped windowId).
-          // KNOWN SEMANTICS GAP (issue #97 review, pre-existing): this carries the OUTER
-          // windowRect, while tao's Resized semantically carries the INNER size on
-          // other platforms — the app-facing path is corrected downstream
-          // (tauri-runtime-wry re-reads inner_size), but raw-event consumers see
-          // the outer size. Follow-up: prefer the same event's drawableRect.
           //
           // Issue Eulogizethesun/tauri#107: windowRectChange covers position AND
           // size, but this arm only ever dispatched Resized, so WindowEvent::Moved
@@ -838,14 +898,27 @@ impl<T: 'static> EventLoop<T> {
           //   this event is their only initial-size signal);
           // - degenerate rects (minimize/hide collapse to 0×0) only update the
           //   cache — dispatching Resized(0,0) would corrupt downstream bounds.
+          //
+          // Review R11 (issue #97 follow-up): Resized now carries the INNER
+          // (drawable) size, matching tao's cross-platform contract ("the
+          // client area's new dimensions", event.rs — Windows reads the WM_SIZE
+          // client rect, macOS the NSView frame) while Moved keeps the OUTER
+          // window position (macOS likewise uses the NSWindow frame for Moved).
+          // The size comes from the app's inner-rect cache: the
+          // window_rect_change closure stores this same event's drawableRect
+          // BEFORE dispatching ContentRectChange (same closure, same thread),
+          // so this always reads the current event's inner size. It falls back
+          // to the outer rect only while no readable drawable has ever
+          // arrived; the pair-in/pair-out cache contract plus the ArkTS
+          // post-load seed keep that fallback consistent.
           let window_id = content_rect.window_id;
-          let (left, top, width, height) = (
-            content_rect.rect.left,
-            content_rect.rect.top,
-            content_rect.rect.width,
-            content_rect.rect.height,
-          );
-          let degenerate = width <= 0 || height <= 0;
+          let (left, top) = (content_rect.rect.left, content_rect.rect.top);
+          // Degeneracy (minimize/hide) is checked on the OUTER rect — the
+          // inner cache may still hold the last non-degenerate drawable.
+          let outer_degenerate = content_rect.rect.width <= 0 || content_rect.rect.height <= 0;
+          let inner = app.inner_rect_for(window_id);
+          let (width, height) = (inner.width, inner.height);
+          let degenerate = outer_degenerate || width <= 0 || height <= 0;
           let prev = LAST_DISPATCHED_RECTS
             .lock()
             .ok()
@@ -887,24 +960,7 @@ impl<T: 'static> EventLoop<T> {
             _ => {}
           }
         }
-        MainEvent::GainedFocus => {
-          // Focus is an app-level UIAbility stage event (StageEventType::ACTIVE),
-          // not per-Float-sub-window. Keep window_id = 0 (main window).
-          HAS_FOCUS.store(true, Ordering::Relaxed);
-          // Modifier state is tracked from key events (issue #109); a window
-          // that regained focus may have missed modifier releases while
-          // unfocused — start clean rather than trust a stale set.
-          if let Ok(mut modifiers) = KEYBOARD_MODIFIERS.lock() {
-            *modifiers = ModifiersState::empty();
-          }
-          call_event_handler!(
-            event_loop_cell,
-            event::Event::WindowEvent {
-              window_id: window::WindowId(WindowId(0)),
-              event: event::WindowEvent::Focused(true),
-            }
-          );
-        }
+        MainEvent::GainedFocus => Self::handle_gained_focus(&event_loop_cell),
         MainEvent::LostFocus => {
           // Focus is an app-level UIAbility stage event (StageEventType::INACTIVE).
           // Keep window_id = 0 (main window).
@@ -1095,6 +1151,10 @@ impl<T: 'static> EventLoop<T> {
         // AppControlExt::terminate(env, 0) (MainThreadSync bridge call).
         // run_loop callbacks execute on the N-API main thread, so
         // get_main_thread_env() returns Some(env).
+        // The 0 is hardcoded: the OHOS exit path collapses
+        // `ControlFlow::Exit` (= `ExitWithCode(0)`) into a boolean
+        // pending-exit flag, so any exit code requested by the app is
+        // dropped here and the process always exits with 0.
         let env_cell = openharmony_ability::get_main_thread_env();
         let env_ref = env_cell.borrow();
         if let Some(env) = env_ref.as_ref() {
@@ -1256,6 +1316,7 @@ mod input_tests {
             m.contains(ModifiersState::SUPER)
           ),
           event::WindowEvent::ReceivedImeText(s) => format!("ImeText({s})"),
+          event::WindowEvent::Focused(f) => format!("Focused({f})"),
           _ => "Other".to_string(),
         },
         _ => "NonWindow".to_string(),
@@ -1560,6 +1621,14 @@ mod input_tests {
     })
   }
 
+  /// Set the process-level KEYBOARD_MODIFIERS static directly (a poisoned
+  /// lock is ignored — no test panics while holding it).
+  fn set_modifiers(modifiers: ModifiersState) {
+    if let Ok(mut m) = KEYBOARD_MODIFIERS.lock() {
+      *m = modifiers;
+    }
+  }
+
   #[test]
   fn key_down_up_and_autorepeat() {
     PRESSED_KEYS.with(|k| k.borrow_mut().clear());
@@ -1582,6 +1651,10 @@ mod input_tests {
   #[test]
   fn key_location_for_modifier_pairs() {
     PRESSED_KEYS.with(|k| k.borrow_mut().clear());
+    // KEYBOARD_MODIFIERS is a process-level static shared with the parallel
+    // gained-focus test: reset before (no assumed initial state) and after
+    // (this test leaves SHIFT held) so neither test flakes the other.
+    set_modifiers(ModifiersState::empty());
     let evs = run_collected(|cell| {
       EventLoop::<()>::handle_input_event(cell, &key(OhosKeyCode::ShiftLeft, Action::Down));
       EventLoop::<()>::handle_input_event(cell, &key(OhosKeyCode::ShiftRight, Action::Down));
@@ -1598,6 +1671,35 @@ mod input_tests {
     assert!(evs[2].contains("loc=Right"), "{}", evs[2]);
     assert!(evs[3].contains("loc=Numpad"), "{}", evs[3]);
     PRESSED_KEYS.with(|k| k.borrow_mut().clear());
+    set_modifiers(ModifiersState::empty());
+  }
+
+  // ─── handle_gained_focus ─────────────────────────────────────────────
+
+  #[test]
+  fn gained_focus_clears_stale_modifiers_before_focus() {
+    // KEYBOARD_MODIFIERS is a process-level static Mutex and #[test]s run in
+    // parallel — the two cases must stay serialized inside this one fn, and
+    // the static is reset at both ends so neither case observes another
+    // test's residue.
+    set_modifiers(ModifiersState::empty());
+    // Stale modifiers (e.g. CONTROL held when focus was lost) are cleared
+    // with an observable ModifiersChanged dispatched BEFORE Focused(true)
+    // (Review R21 / issue Eulogizethesun/tauri#137).
+    set_modifiers(ModifiersState::CONTROL);
+    let evs = run_collected(|cell| EventLoop::<()>::handle_gained_focus(cell));
+    assert_eq!(
+      evs,
+      vec![
+        "ModifiersChanged(ctrl=false,shift=false,alt=false,logo=false)".to_string(),
+        "Focused(true)".to_string(),
+      ]
+    );
+    // An already-empty set (first ACTIVE at startup) dispatches no redundant
+    // ModifiersChanged — only Focused(true).
+    let evs = run_collected(|cell| EventLoop::<()>::handle_gained_focus(cell));
+    assert_eq!(evs, vec!["Focused(true)".to_string()]);
+    set_modifiers(ModifiersState::empty());
   }
 
   // ─── IME events ──────────────────────────────────────────────────────

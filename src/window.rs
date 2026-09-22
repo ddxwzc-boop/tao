@@ -574,6 +574,13 @@ impl WindowBuilder {
   /// ## Platform-specific
   ///
   /// - **iOS / Android / Linux:** Unsupported.
+  /// - **OHOS:** Implemented via `OH_WindowManager_SetWindowPrivacyMode` (API
+  ///   15+); the window's content is excluded from screenshots, recording, and
+  ///   casting. Requires `ohos.permission.PRIVACY_WINDOW` (normal,
+  ///   system_grant) declared in the app's entry module; when the permission is
+  ///   missing the call only logs a warning — the window is left unprotected
+  ///   and no error is reported (same degradation as
+  ///   `Window::set_content_protection`).
   #[inline]
   pub fn with_content_protection(mut self, protected: bool) -> WindowBuilder {
     self.window.content_protection = protected;

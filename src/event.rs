@@ -157,7 +157,7 @@ pub enum Event<'a, T: 'static> {
 
   /// Emitted when the system wants to close the app but the close is still
   /// cancellable — the PC/2in1 pre-close interception point
-  /// (`UIAbility.onPrepareToTerminateAsync`, requires
+  /// (`UIAbility.onPrepareToTerminateAsync`, API 15+, requires
   /// `ohos.permission.PREPARE_APP_TERMINATE`).
   ///
   /// Fired BEFORE any teardown for window-close-button / taskbar / tray exits.
